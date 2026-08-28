@@ -4,6 +4,9 @@ use cubecl_wgpu::{WgpuRuntime, RuntimeOptions, WebGpu, WgpuDevice};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
+// KORREKTUR: Importiert das Cell-Modul aus der Standardbibliothek für den Zustandsspeicher
+use std::cell::Cell;
+
 pub mod stereo_synth;
 use stereo_synth::{cubek_true_stereo_synth_reverb, StereoIrConfig};
 
@@ -11,13 +14,21 @@ use stereo_synth::{cubek_true_stereo_synth_reverb, StereoIrConfig};
 pub struct WebAudioEngine {
     client: Option<ComputeClient<WgpuRuntime>>, 
     fft_size: u32,
+    // Hüllkurven-Zustandsspeicher für die Interpolation
+    last_frequency: Cell<f32>,
+    last_cutoff: Cell<f32>,
 }
 
 #[wasm_bindgen]
 impl WebAudioEngine {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Self {
-        Self { client: None, fft_size: 2048 }
+        Self { 
+            client: None, 
+            fft_size: 2048,
+            last_frequency: Cell::new(110.0),
+            last_cutoff: Cell::new(800.0),
+        }
     }
 
     pub fn init_engine_async(mut self) -> js_sys::Promise {
@@ -46,20 +57,30 @@ impl WebAudioEngine {
         let cube_dim = CubeDim { x: 256, y: 1, z: 1 };
         let array_arg = unsafe { ArrayArg::from_raw_parts(handle_out.clone(), output_len) };
 
+        // Lese die alten Parameterwerte aus dem Zustandsspeicher
+        let old_freq = self.last_frequency.get();
+        let old_cut = self.last_cutoff.get();
+
         cubek_true_stereo_synth_reverb::launch::<f32, WgpuRuntime>(
             &client,
             grid_dim,
             cube_dim,
             array_arg,
             frequency,
-            44100.0,
             cutoff,
+            old_freq,  // Reiche den alten Frequenzwert an die GPU weiter
+            old_cut,   // Reiche den alten Cutoffwert an die GPU weiter
+            44100.0,
             room_size,
             1.2,
             wet_mix,
             0.85,
             self.fft_size,
         );
+
+        // Aktualisiere den Zustandsspeicher für den nächsten Block
+        self.last_frequency.set(frequency);
+        self.last_cutoff.set(cutoff);
 
         future_to_promise(async move {
             let result_bytes_res = client.read_async(vec![handle_out]).await;

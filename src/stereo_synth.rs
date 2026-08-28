@@ -12,9 +12,14 @@ pub struct StereoIrConfig {
 #[cube(launch)]
 pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
     output_stereo_audio: &mut Array<F>,
+    // Aktuelle Parameter
     frequency: F,
-    sample_rate: F,
     dyn_cutoff: F,
+    // PARAMETER-GLÄTTUNG: Historische Werte für cubek_interpolate
+    old_frequency: F,
+    old_cutoff: F,
+    
+    sample_rate: F,
     room_size_seconds: F,
     high_freq_damping: F,
     wet_dry_mix: F,
@@ -30,37 +35,41 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
         let pi = F::new(std::f32::consts::PI);
         let num_bins = fft_size / 2 + 1;
 
+        // --- CUBEK_INTERPOLATE: LINEARER SPLINE PRO THREAD/SAMPLE n ---
+        // Berechne den Fortschritts-Faktor t für diesen spezifischen Zeitschritt n
+        let t = F::cast_from(n) / F::cast_from(fft_size);
+        
+        // Stufenloses Glätten der Modulationsziele im lokalen GPU-Register
+        let current_freq = old_frequency + (t * (frequency - old_frequency));
+        let current_cutoff = old_cutoff + (t * (dyn_cutoff - old_cutoff));
+
         for k in 0..num_bins {
             let bin_freq = (F::cast_from(k) * sample_rate) / F::cast_from(fft_size);
 
             let mut synth_real = F::new(0.0);
             let mut synth_imag = F::new(0.0);
 
-            // 1. GENERIERUNG (Weitwinkliges Frequenzraster für Bins)
+            // Generierung mit der geglätteten Frequenz
             if k > 0 && bin_freq < sample_rate / F::new(2.0) {
-                let harmonic_number = bin_freq / frequency;
+                let harmonic_number = bin_freq / current_freq;
                 let fract = harmonic_number - F::floor(harmonic_number);
                 
-                // Raster auf 0.15 geweitet, damit die Energie sauber in die Bins fließt
                 if fract < F::new(0.15) || fract > F::new(0.85) {
                     let amp = F::new(1.0) / F::max(F::new(1.0), F::floor(harmonic_number));
                     if k % 2 == 0 { synth_real = amp; } else { synth_imag = amp; }
                 }
             }
 
-            // Moog Brickwall Filter
-            let filter_gain = if bin_freq <= dyn_cutoff { F::new(1.0) } else { F::new(0.0) };
+            // Moog Filter mit geglättetem Cutoff
+            let filter_gain = if bin_freq <= current_cutoff { F::new(1.0) } else { F::new(0.0) };
             let filtered_synth_real = synth_real * filter_gain;
             let filtered_synth_imag = synth_imag * filter_gain;
 
-            // Hall-Dämpfung
             let freq_factor = F::new(1.0) + (bin_freq * high_freq_damping * F::new(0.0001));
             let effective_decay = room_size_seconds / freq_factor;
             let amplitude = F::exp(-F::cast_from(k) / F::max(F::new(1.0), effective_decay * F::new(10.0)));
 
             let k_f = F::cast_from(k);
-            
-            // Symmetrisches Pseudo-Rauschen zwischen -1.0 und 1.0 (DC-Offset eliminiert)
             let rand_l_real = (F::sin(k_f * F::new(12.9898)) - F::floor(F::sin(k_f * F::new(12.9898)))) * F::new(2.0) - F::new(1.0);
             let rand_l_imag = (F::cos(k_f * F::new(78.233)) - F::floor(F::cos(k_f * F::new(78.233)))) * F::new(2.0) - F::new(1.0);
             let rand_r_real = (F::sin(k_f * F::new(45.164)) - F::floor(F::sin(k_f * F::new(45.164)))) * F::new(2.0) - F::new(1.0);
@@ -79,7 +88,6 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
             let final_r_real = mid_real + stereo_width * (ir_r_real - mid_real);
             let final_r_imag = mid_imag + stereo_width * (ir_r_imag - mid_imag);
 
-            // Komplexe Multiplikation
             let wet_l_real = filtered_synth_real * final_l_real - filtered_synth_imag * final_l_imag;
             let wet_l_imag = filtered_synth_real * final_l_imag + filtered_synth_imag * final_l_real;
             let wet_r_real = filtered_synth_real * final_r_real - filtered_synth_imag * final_r_imag;
@@ -90,7 +98,6 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
             let res_r_real = (F::new(1.0) - wet_dry_mix) * filtered_synth_real + wet_dry_mix * wet_r_real;
             let res_r_imag = (F::new(1.0) - wet_dry_mix) * filtered_synth_imag + wet_dry_mix * wet_r_imag;
 
-            // 3. ECHTE INVERSE DFT AKKUMULATION (Vorzeichen korrigiert auf "+")
             let angle = (F::new(2.0) * pi * F::cast_from(k) * F::cast_from(n)) / F::cast_from(fft_size);
             let cos_a = F::cos(angle);
             let sin_a = F::sin(angle);
