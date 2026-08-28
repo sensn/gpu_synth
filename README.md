@@ -1,3 +1,12 @@
+## Build & Run
+
+ cargo install wasm-pack
+ wasm-pack build --target web
+
+# Falls installiert, startet npx sofort einen statischen Server
+  npx serve .
+  
+------------------------------
 ## Technischer Bericht & Spezifikation: High-Performance GPU-Audio-Engine in CubeCL
 Dieser Bericht liefert eine detaillierte mathematische und architektonische Analyse des entwickelten True-Stereo Hybrid-Synthesizers mit integriertem Faltungshall, basierend auf CubeCL (v0.10.0) und cubek.
 ------------------------------
