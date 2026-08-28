@@ -1,9 +1,10 @@
 ## Build & Run
 
  cargo install wasm-pack
+ 
  wasm-pack build --target web
 
-# Falls installiert, startet npx sofort einen statischen Server
+
   npx serve .
   
 ------------------------------
