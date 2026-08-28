@@ -1,5 +1,4 @@
 #![allow(warnings)]
-#![allow(warnings)]
 use cubecl::prelude::*;
 use cubecl_wgpu::{WgpuRuntime, RuntimeOptions, WebGpu, WgpuDevice};
 use wasm_bindgen::prelude::*;
@@ -18,25 +17,15 @@ pub struct WebAudioEngine {
 impl WebAudioEngine {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Self {
-        // Zu 100% sicher, da keinerlei Hardware-Abfrage im Konstruktor stattfindet
         Self { client: None, fft_size: 2048 }
     }
 
-    /// Initialisiert die echte GPU asynchron über das WebGpu-Schnittstellen-Tag
     pub fn init_engine_async(mut self) -> js_sys::Promise {
         future_to_promise(async move {
-            // KORREKTUR: Nutze Default::default() anstelle der nicht existierenden Enum-Variante
             let device = Default::default();
-            
-            // 1. ASYNC FIX: Wir fordern das Setup asynchron über WebGpu an
             let setup = cubecl_wgpu::init_setup_async::<WebGpu>(&device, RuntimeOptions::default()).await;
-            
-            // 2. KORREKTUR: Reiche eine frische Default-Instanz weiter, um den .clone()-Fehler zu umgehen
             let wgpu_device = cubecl_wgpu::init_device(setup, RuntimeOptions::default());
-            
-            // 3. Den ComputeClient direkt aus dem geladenen Hardware-Device erzeugen
             self.client = Some(ComputeClient::load(&wgpu_device));
-            
             Ok(JsValue::from(self))
         })
     }
@@ -57,7 +46,6 @@ impl WebAudioEngine {
         let cube_dim = CubeDim { x: 256, y: 1, z: 1 };
         let array_arg = unsafe { ArrayArg::from_raw_parts(handle_out.clone(), output_len) };
 
-        // ECHTE GPU-INFERENZ auf deinen Grafikkernen unter CachyOS
         cubek_true_stereo_synth_reverb::launch::<f32, WgpuRuntime>(
             &client,
             grid_dim,
@@ -89,5 +77,3 @@ impl WebAudioEngine {
         })
     }
 }
-
-
