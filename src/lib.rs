@@ -3,21 +3,17 @@ use cubecl::prelude::*;
 use cubecl_wgpu::{WgpuRuntime, RuntimeOptions, WebGpu, WgpuDevice};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
-
-// Zustandsspeicher aus der Standardbibliothek für die Hüllkurven und Block-Indexierung
 use std::cell::Cell;
 
 pub mod stereo_synth;
-use stereo_synth::{cubek_true_stereo_synth_reverb};
+use stereo_synth::cubek_true_stereo_synth_reverb;
 
 #[wasm_bindgen]
 pub struct WebAudioEngine {
     client: Option<ComputeClient<WgpuRuntime>>, 
     fft_size: u32,
-    // Hüllkurven-Zustandsspeicher für die Parameter-Interpolation
     last_frequency: Cell<f32>,
     last_cutoff: Cell<f32>,
-    // REPARATUR-ERWEITERUNG: Verfolgt den globalen Fortlauf der generierten Blöcke für LFO & ADSR
     block_counter: Cell<u32>,
 }
 
@@ -30,7 +26,7 @@ impl WebAudioEngine {
             fft_size: 2048,
             last_frequency: Cell::new(110.0),
             last_cutoff: Cell::new(800.0),
-            block_counter: Cell::new(0), // Startet beim allerersten Audio-Block
+            block_counter: Cell::new(0),
         }
     }
 
@@ -44,7 +40,16 @@ impl WebAudioEngine {
         })
     }
 
-    pub fn render_block_async(&self, frequency: f32, cutoff: f32, room_size: f32, wet_mix: f32) -> js_sys::Promise {
+    // FIX: Die Signatur nimmt nun attack und decay als f32 entgegen!
+    pub fn render_block_async(
+        &self, 
+        frequency: f32, 
+        cutoff: f32, 
+        room_size: f32, 
+        wet_mix: f32, 
+        attack: f32, 
+        decay: f32
+    ) -> js_sys::Promise {
         let client = self.client.as_ref()
             .expect("Engine nicht initialisiert. Rufe zuerst init_engine_async auf.")
             .clone();
@@ -60,14 +65,11 @@ impl WebAudioEngine {
         let cube_dim = CubeDim { x: 256, y: 1, z: 1 };
         let array_arg = unsafe { ArrayArg::from_raw_parts(handle_out.clone(), output_len) };
 
-        // Lese die historischen Parameterwerte aus den Cells aus
         let old_freq = self.last_frequency.get();
         let old_cut = self.last_cutoff.get();
-        
-        // REPARATUR-ERWEITERUNG: Hole den aktuellen Zeit-Index des Streams
         let current_block = self.block_counter.get();
 
-        // Starte den Kernel mit der erweiterten ADSR/LFO Signatur
+        // Übergabe aller Parameter an den GPU-Kernel
         cubek_true_stereo_synth_reverb::launch::<f32, WgpuRuntime>(
             &client,
             grid_dim,
@@ -75,22 +77,21 @@ impl WebAudioEngine {
             array_arg,
             frequency,
             cutoff,
-            old_freq,  // Reiche den alten Frequenzwert an die GPU weiter
-            old_cut,   // Reiche den alten Cutoffwert an die GPU weiter
+            old_freq,  
+            old_cut,   
             44100.0,
             room_size,
             1.2,
             wet_mix,
             0.85,
-            current_block, // REPARATUR-ERWEITERUNG: Der u32-Block-Zähler fließt direkt in das GPU-Register
+            current_block, 
+            attack, // Reicht den Attack-Wert an die GPU weiter
+            decay,  // Reiche den Decay-Wert an die GPU weiter
             self.fft_size,
         );
 
-        // Aktualisiere den Zustandsspeicher für den nächsten Block
         self.last_frequency.set(frequency);
         self.last_cutoff.set(cutoff);
-        
-        // REPARATUR-ERWEITERUNG: Erhöhe den Zähler für die nächste Puffer-Berechnung
         self.block_counter.set(current_block + 1);
 
         future_to_promise(async move {

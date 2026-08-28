@@ -49,6 +49,17 @@
         <label>Hauptlautstärke (Gain): <span id="gain-val">4.0x</span></label>
         <input type="range" id="gain-slider" min="0" max="15" value="4" step="0.5">
     </div>
+    
+      <!-- ADSR ATTACK & DECAY -->
+    <div class="control-group">
+        <label>ADSR Attack: <span id="attack-val">0.10s</span></label>
+        <input type="range" id="attack-slider" min="0.0" max="2.0" value="0.1" step="0.05">
+    </div>
+
+    <div class="control-group">
+        <label>ADSR Decay: <span id="decay-val">0.30s</span></label>
+        <input type="range" id="decay-slider" min="0.0" max="2.0" value="0.3" step="0.05">
+    </div>
 
     <div class="control-group">
         <label>Frequenz (Note): <span id="freq-val">110 Hz</span></label>
@@ -84,6 +95,18 @@
     let clipTimeoutL = null;
     let clipTimeoutR = null;
 
+   
+
+    let targetFreq = 110.0;
+    let currentFreq = 110.0;
+    let targetCutoff = 800.0;
+    let currentCutoff = 800.0;
+
+    let targetAttack = 0.1;
+    let currentAttack = 0.1;
+    let targetDecay = 0.3;
+    let currentDecay = 0.3;
+
     async function startEngine() {
         console.log("Initialisiere WebAssembly und echte WebGPU-Hardware...");
         try {
@@ -103,7 +126,13 @@
             
             document.getElementById("start-btn").disabled = true;
             document.getElementById("start-btn").innerText = "Engine läuft 🟢";
-
+// Initialwerte direkt von den Slidern abfragen, um Knackser im Startmoment zu verhindern
+            targetAttack = parseFloat(document.getElementById("attack-slider").value);
+            targetDecay = parseFloat(document.getElementById("decay-slider").value);
+            currentAttack = targetAttack;
+            currentDecay = targetDecay;
+            
+            //
             nextStartTime = audioContext.currentTime + 0.15;
             isPlaying = true;
 
@@ -123,17 +152,25 @@
         setTimeout(schedulerLoop, lookAheadTimeMs);
     }
 
-    async function spawnGpuBlock() {
-        const freq = parseFloat(document.getElementById("freq-slider").value);
-        const cutoff = parseFloat(document.getElementById("cutoff-slider").value);
+   async function spawnGpuBlock() {
+        targetFreq = parseFloat(document.getElementById("freq-slider").value);
+        targetCutoff = parseFloat(document.getElementById("cutoff-slider").value);
+        targetAttack = parseFloat(document.getElementById("attack-slider").value);
+        targetDecay = parseFloat(document.getElementById("decay-slider").value);
+        
         const room = parseFloat(document.getElementById("room-slider").value);
         const wet = parseFloat(document.getElementById("wet-slider").value) / 100.0;
-        
-        // Holt den eingestellten Multiplikator vom neuen Slider ab
         const volumeGain = parseFloat(document.getElementById("gain-slider").value);
 
+        // KORREKTUR: Sanftere Dämpfungsrate (0.15 statt 0.3) für die Zeit-Parameter!
+        // Das verhindert harte Amplitudensprünge (Knackser) an den Blockübergängen bei großen Werten.
+        currentFreq = currentFreq + 0.3 * (targetFreq - currentFreq);
+        currentCutoff = currentCutoff + 0.3 * (targetCutoff - currentCutoff);
+        currentAttack = currentAttack + 0.15 * (targetAttack - currentAttack);
+        currentDecay = currentDecay + 0.15 * (targetDecay - currentDecay);
+
         try {
-            const audioData = await audioEngine.render_block_async(freq, cutoff, room, wet);
+            const audioData = await audioEngine.render_block_async(currentFreq, currentCutoff, room, wet, currentAttack, currentDecay);
 
             const bufferSize = audioData.length / 2;
             const audioBuffer = audioContext.createBuffer(2, bufferSize, 44100);
@@ -145,7 +182,6 @@
             let maxPeakR = 0.0;
 
             for (let i = 0; i < bufferSize; i++) {
-                // KORREKTUR: Multipliziere jedes Sample direkt mit dem Gain-Faktor
                 const lSample = audioData[i * 2] * volumeGain;
                 const rSample = audioData[i * 2 + 1] * volumeGain;
                 
@@ -174,7 +210,6 @@
             console.error("WebGPU Pipeline Stau:", gpuError);
         }
     }
-
       // --- HOCHPRÄZISE LOGARITHMISCHE PEGELANZEIGE (dBFS) ---
     function updateVuMeter(peakL, peakR) {
         // Schutz vor Logarithmus von 0 (Stille)
@@ -218,6 +253,7 @@
 
     document.getElementById("start-btn").addEventListener("click", startEngine);
     document.getElementById("gain-slider").addEventListener("input", (e) => document.getElementById("gain-val").innerText = e.target.value + "x");
+    document.getElementById("attack-slider").addEventListener("input", (e) => document.getElementById("attack-val").innerText = parseFloat(e.target.value).toFixed(2) + "s");document.getElementById("decay-slider").addEventListener("input", (e) => document.getElementById("decay-val").innerText = parseFloat(e.target.value).toFixed(2) + "s");
     document.getElementById("freq-slider").addEventListener("input", (e) => document.getElementById("freq-val").innerText = e.target.value + " Hz");
     document.getElementById("cutoff-slider").addEventListener("input", (e) => document.getElementById("cutoff-val").innerText = e.target.value + " Hz");
     document.getElementById("room-slider").addEventListener("input", (e) => document.getElementById("room-val").innerText = e.target.value + "s");

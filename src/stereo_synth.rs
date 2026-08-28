@@ -13,8 +13,9 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
     high_freq_damping: F,
     wet_dry_mix: F,
     stereo_width: F,
-    // NEU: Globale Zeit-Parameter für ADSR & LFO
     global_block_index: u32,
+    attack_time: F,
+    decay_time: F,
     #[comptime] fft_size: u32,
 ) {
     let n = ABSOLUTE_POS_X;
@@ -26,42 +27,35 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
         let pi = F::new(std::f32::consts::PI);
         let num_bins = fft_size / 2 + 1;
 
-        // --- CUBEK_STD: ZEIT-PROJEKTION PRO SAMPLE ---
-        // Berechne die absolute Zeit dieses spezifischen Samples im Gesamt-Stream
+        // Dynamische block-interne Hüllkurve
         let samples_per_block = F::cast_from(fft_size);
-        let total_samples = (F::cast_from(global_block_index) * samples_per_block) + F::cast_from(n);
-        let current_time = total_samples / sample_rate;
+        let block_progress = F::cast_from(n) / samples_per_block;
 
-        // --- ADSR HÜLLKURVEN MATHEMATIK (CUBEK_STD STIL) ---
-        let attack_time = F::new(0.1);  // 100ms Einschwingzeit
-        let decay_time = F::new(0.3);   // 300ms Abschwellzeit
-        let sustain_lvl = F::new(0.6);  // 60% Haltepegel
+        let sustain_lvl = F::new(0.6);
+        let mut adsr_amp = F::new(1.0);
+
+        let safe_attack = F::max(F::new(0.01), attack_time);
         
-        let mut adsr_amp = F::new(0.0);
-        
-        if current_time < attack_time {
-            adsr_amp = current_time / attack_time;
-        } else if current_time < (attack_time + decay_time) {
-            let decay_progress = (current_time - attack_time) / decay_time;
-            adsr_amp = F::new(1.0) - (decay_progress * (F::new(1.0) - sustain_lvl));
-        } else {
-            adsr_amp = sustain_lvl;
+        if attack_time > F::new(0.1) {
+            adsr_amp = block_progress / attack_time;
+            if adsr_amp > F::new(1.0) { adsr_amp = F::new(1.0); }
+        } else if decay_time > F::new(0.1) {
+            adsr_amp = F::new(1.0) - (block_progress * decay_time * (F::new(1.0) - sustain_lvl));
+            if adsr_amp < sustain_lvl { adsr_amp = sustain_lvl; }
         }
 
-        // --- LFO MODULATION FÜR DEN CUTOFF ---
-        let lfo_freq = F::new(5.0); // 5 Hz Modulationsgeschwindigkeit
-        let lfo_depth = F::new(400.0); // Modulations-Breite in Hertz
-        // Sinus-Schwingung basierend auf der absoluten Zeit
+        // LFO Modulation für den Cutoff
+        let total_samples = (F::cast_from(global_block_index) * samples_per_block) + F::cast_from(n);
+        let current_time = total_samples / sample_rate;
+        let lfo_freq = F::new(5.0); 
+        let lfo_depth = F::new(400.0); 
         let lfo_mod = F::sin(F::new(2.0) * pi * lfo_freq * current_time);
 
-        // --- SLOPE INTERPOLATION (SLIDER-GLÄTTUNG) ---
-        let t = F::cast_from(n) / samples_per_block;
-        let base_freq = old_frequency + (t * (frequency - old_frequency));
-        let base_cutoff = old_cutoff + (t * (dyn_cutoff - old_cutoff));
+        // Slope-Interpolation
+        let base_freq = old_frequency + (block_progress * (frequency - old_frequency));
+        let base_cutoff = old_cutoff + (block_progress * (dyn_cutoff - old_cutoff));
 
-        // Kombiniere manuellen Cutoff mit der LFO-Modulation
         let mut modulated_cutoff = base_cutoff + (lfo_mod * lfo_depth);
-        // Schutzgating via cubek_std Limitierung: Cutoff darf niemals unter 50Hz fallen
         if modulated_cutoff < F::new(50.0) { modulated_cutoff = F::new(50.0); }
 
         for k in 0..num_bins {
@@ -80,7 +74,6 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
                 }
             }
 
-            // Anwendung des modulierten Cutoffs
             let filter_gain = if bin_freq <= modulated_cutoff { F::new(1.0) } else { F::new(0.0) };
             let filtered_synth_real = synth_real * filter_gain;
             let filtered_synth_imag = synth_imag * filter_gain;
@@ -91,7 +84,10 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
 
             let k_f = F::cast_from(k);
             let rand_l_real = (F::sin(k_f * F::new(12.9898)) - F::floor(F::sin(k_f * F::new(12.9898)))) * F::new(2.0) - F::new(1.0);
+            
+            // KORREKTUR: "HardF" durch den korrekten generischen Typen "F" ersetzt!
             let rand_l_imag = (F::cos(k_f * F::new(78.233)) - F::floor(F::cos(k_f * F::new(78.233)))) * F::new(2.0) - F::new(1.0);
+            
             let rand_r_real = (F::sin(k_f * F::new(45.164)) - F::floor(F::sin(k_f * F::new(45.164)))) * F::new(2.0) - F::new(1.0);
             let rand_r_imag = (F::cos(k_f * F::new(92.741)) - F::floor(F::cos(k_f * F::new(92.741)))) * F::new(2.0) - F::new(1.0);
 
@@ -131,7 +127,6 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
         let idx_l: usize = (n * 2) as usize;
         let idx_r: usize = (n * 2 + 1) as usize;
         
-        // Multipliziere das Endergebnis mit der ADSR-Lautstärkehüllkurve
         output_stereo_audio[idx_l] = final_sample_l * scale * adsr_amp;
         output_stereo_audio[idx_r] = final_sample_r * scale * adsr_amp;
     }
