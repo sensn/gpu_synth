@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <title>CubeCL WebGPU Audio Synthesizer</title>
+    <style>
+        body { font-family: sans-serif; background: #121212; color: #fff; padding: 40px; }
+        .control-group { margin-bottom: 20px; }
+        label { display: inline-block; width: 180px; }
+        button { padding: 10px 20px; font-size: 16px; background: #00ffcc; border: none; cursor: pointer; color: #000; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+    <h1>🚀 Hybrid-Synth & Faltungshall via WebGPU</h1>
+    <p>Berechnet komplett autonom auf deiner Grafikkarte mittels CubeCL / WebAssembly.</p>
+
+    <div class="control-group">
+        <button id="start-btn">Audio Engine Starten</button>
+    </div>
+
+    <div class="control-group">
+        <label>Frequenz (Note): <span id="freq-val">110 Hz</span></label>
+        <input type="range" id="freq-slider" min="55" max="440" value="110" step="1">
+    </div>
+
+    <div class="control-group">
+        <label>Moog-Filter Cutoff: <span id="cutoff-val">800 Hz</span></label>
+        <input type="range" id="cutoff-slider" min="200" max="4000" value="800">
+    </div>
+
+    <div class="control-group">
+        <label>Hall-Raumgröße: <span id="room-val">2.5s</span></label>
+        <input type="range" id="room-slider" min="0.5" max="5.0" value="2.5" step="0.1">
+    </div>
+
+    <div class="control-group">
+        <label>Hall-Anteil (Wet Mix): <span id="wet-val">40%</span></label>
+        <input type="range" id="wet-slider" min="0" max="100" value="40">
+    </div>
+
+<!-- Dein HTML-Slider Layout bleibt exakt identisch -->
+<script type="module">
+    import init, { WebAudioEngine } from './pkg/synth.js';
+
+    let audioEngine;
+    let audioContext;
+    let nextStartTime = 0;
+    
+    // EXAKTER FIX: Hier deklarieren wir die globalen Kontroll-Variablen sauber im Scope
+    let isPlaying = false; 
+    const lookAheadTimeMs = 25.0;   // Wie oft der Scheduler prüft
+    const scheduleAheadTime = 0.1;  // 100ms Audio-Vorsprung auf der GPU vorhalten
+
+    async function startEngine() {
+        console.log("Initialisiere WebAssembly und echte WebGPU-Hardware...");
+        try {
+            // 1. WASM initialisieren
+            await init();
+            
+            // 2. Engine erzeugen
+            let rawEngine = new WebAudioEngine();
+            audioEngine = await rawEngine.init_engine_async();
+            console.log("CubeCL WebAudioEngine geladen. Starte GPU-Warm-Up... ⚙️");
+
+            // 3. Stiller Vorab-Render-Block zum Einbrennen des JIT-Kernels
+            await audioEngine.render_block_async(0, 0, 0, 0);
+            console.log("GPU Kernel-Kompilierung (WGSL) abgeschlossen! 🚀 Pipeline ist frei.");
+
+            // 4. Audio-Kontext wecken und aktivieren
+            audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 44100 });
+            if (audioContext.state === 'suspended') {
+                await audioContext.resume();
+            }
+            
+            document.getElementById("start-btn").disabled = true;
+            document.getElementById("start-btn").innerText = "Engine läuft 🟢";
+
+            // Vorsprung für die Audiowarteschlange aufbauen
+            nextStartTime = audioContext.currentTime + 0.15;
+            isPlaying = true;
+
+            // Starte den flüssigen Scheduler-Loop
+            schedulerLoop();
+        } catch (error) {
+            console.error("Fehler beim Starten der Engine:", error);
+        }
+    }
+
+    // Der Scheduler prüft ununterbrochen, ob neue GPU-Blöcke berechnet werden müssen
+    async function schedulerLoop() {
+        if (!isPlaying) return;
+
+        // Solange unsere Audiowarteschlange nicht voll genug ist, jagen wir neue Blöcke durch die GPU
+        while (nextStartTime < audioContext.currentTime + scheduleAheadTime) {
+            await spawnGpuBlock();
+        }
+
+        // Schnelle, ressourcenschonende Look-Ahead Checks
+        setTimeout(schedulerLoop, lookAheadTimeMs);
+    }
+
+    async function spawnGpuBlock() {
+        const freq = parseFloat(document.getElementById("freq-slider").value);
+        const cutoff = parseFloat(document.getElementById("cutoff-slider").value);
+        const room = parseFloat(document.getElementById("room-slider").value);
+        const wet = parseFloat(document.getElementById("wet-slider").value) / 100.0;
+
+        try {
+            // GPU rechnet asynchron im Hintergrund
+            const audioData = await audioEngine.render_block_async(freq, cutoff, room, wet);
+
+            const bufferSize = audioData.length / 2;
+            const audioBuffer = audioContext.createBuffer(2, bufferSize, 44100);
+            
+            const leftChannel = audioBuffer.getChannelData(0);
+            const rightChannel = audioBuffer.getChannelData(1);
+
+            // Interleaved Array entpacken (L, R, L, R -> Getrennte Audio-Kanäle)
+            for (let i = 0; i < bufferSize; i++) {
+                leftChannel[i] = audioData[i * 2];
+                rightChannel[i] = audioData[i * 2 + 1];
+            }
+
+            const bufferSource = audioContext.createBufferSource();
+            bufferSource.buffer = audioBuffer;
+            bufferSource.connect(audioContext.destination);
+            
+            // Reiche den Puffer an die Soundkarte weiter für den exakten zukünftigen Zeitpunkt
+            bufferSource.start(nextStartTime);
+
+            // Zeitstempel für den NÄCHSTEN Puffer erhöhen
+            const bufferDuration = bufferSize / 44100;
+            nextStartTime += bufferDuration;
+
+        } catch (gpuError) {
+            console.error("WebGPU Pipeline Stau:", gpuError);
+        }
+    }
+
+    // UI-Interaktionen verknüpfen
+    document.getElementById("start-btn").addEventListener("click", startEngine);
+    document.getElementById("freq-slider").addEventListener("input", (e) => document.getElementById("freq-val").innerText = e.target.value + " Hz");
+    document.getElementById("cutoff-slider").addEventListener("input", (e) => document.getElementById("cutoff-val").innerText = e.target.value + " Hz");
+    document.getElementById("room-slider").addEventListener("input", (e) => document.getElementById("room-val").innerText = e.target.value + "s");
+    document.getElementById("wet-slider").addEventListener("input", (e) => document.getElementById("wet-val").innerText = e.target.value + "%");
+</script>
+
+</body>
+</html>
