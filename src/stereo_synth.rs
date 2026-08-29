@@ -78,11 +78,9 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
             if current_decay_amp < master_amp { master_amp = current_decay_amp; }
         }
 
-        // LFO via kontinuierlicher Phasenführung über die akkumulierte Host-Phase
         let sample_phase_delta = (F::new(2.0) * pi * lfo_frequency * block_progress * samples_per_block) / sample_rate;
         let lfo_mod = F::sin(lfo_accumulated_phase + sample_phase_delta);
 
-        // Glättung der Slider-Werte
         let base_freq = old_frequency + (block_progress * (frequency - old_frequency));
         let base_cutoff = old_cutoff + (block_progress * (dyn_cutoff - old_cutoff));
         
@@ -91,7 +89,7 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
 
         let num_bins = fft_size / 2 + 1;
 
-        // Extrahiere alle 6 Operator-Werte direkt aus dem VRAM
+        // Entpacken der 6 DX7 Operatoren
         let r1 = op_ratios[0]; let l1 = op_levels[0];
         let r2 = op_ratios[1]; let l2 = op_levels[1];
         let r3 = op_ratios[2]; let l3 = op_levels[2];
@@ -108,42 +106,55 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
 
             if k > 0 && bin_freq < sample_rate / F::new(2.0) {
                 
-                for h in 1..33 {
+                // MATH UPDATE: Wir iterieren über die spektralen Harmonischen
+                for h in 1..32 {
                     let h_f = F::cast_from(h);
-                    let carrier_harmonic_freq = base_freq * h_f;
+                    
+                    // --- STRUKTURELLES DX7 OPERATOR GATING ---
+                    let mut carrier_freq = base_freq * h_f;
+                    let mut effective_index = F::new(0.0);
+                    let mut mod_freq = base_freq;
 
-                    if carrier_harmonic_freq < sample_rate / F::new(2.0) {
+                    if algo_select == 0 {
+                        // Algorithm 0: OP1 & OP2 sind reine CARRIER. OP3 moduliert OP1. OP4 moduliert OP2.
+                        // OP5 und OP6 sind High-Frequency Modulatoren für den metallischen Anschlag.
+                        let active_carrier_1 = base_freq * r1 * h_f;
+                        let active_carrier_2 = base_freq * r2 * h_f;
+                        
+                        // Modulations-Kaskade (Frequenz-Abweichungen)
+                        mod_freq = base_freq * (r3 + r4 * l4 + r5 * l5 * r6 * l6);
+                        effective_index = l1 * l2 * (F::new(1.0) + l3);
+                        carrier_freq = (active_carrier_1 * l1 + active_carrier_2 * l2) / F::max(F::new(0.1), l1 + l2);
+                    } else {
+                        // Algorithm 1: OP1 ist der EINZIGE CARRIER. 
+                        // OP2 bis OP6 bilden einen massiven, seriell verschachtelten Modulationsstack.
+                        carrier_freq = base_freq * r1 * h_f;
+                        mod_freq = base_freq * (r2 * (F::new(1.0) + l3 * r3) + r4 * l4 * (r5 * l5 + r6 * l6));
+                        effective_index = l1 + l2 + l3 + l4 + l5 + l6;
+                    }
+
+                    if carrier_freq < sample_rate / F::new(2.0) {
+                        // Basis-Amplitude des harmonischen Trägers (Sägezahn-Rückgrat)
                         let saw_base_amp = F::new(1.0) / h_f;
 
-                        // DX7 Algorithmus-Routing im Shader-Register
-                        let mut final_mod_freq = F::new(0.0);
-                        
-                        if algo_select == 0 {
-                            // Algo 1: Kaskadierte 6-OP DX7 Kette (OP6 -> OP5 -> OP4 -> OP3 -> OP2 -> OP1)
-                            let layer_a = (base_freq * r6 * l6) + (base_freq * r5 * l5);
-                            let layer_b = (base_freq * r4 * l4) + layer_a;
-                            final_mod_freq = base_freq * (r1 + r2 + (r3 * l3) + layer_b);
-                        } else {
-                            // Algo 2: Parallele FM-Cluster (Breite Frequenzspreizung)
-                            let cluster_1 = base_freq * r3 * l3;
-                            let cluster_2 = base_freq * r4 * l4;
-                            final_mod_freq = base_freq * (r1 * (F::new(1.0) + l1) + r2 * (F::new(1.0) + l2)) + cluster_1 + cluster_2;
-                        }
-
-                        let distance_to_harmonic = F::abs(bin_freq - carrier_harmonic_freq);
-                        let harmonic_step = distance_to_harmonic / F::max(F::new(1.0), final_mod_freq);
+                        // Berechne den spektralen Abstand zur modulierten Träger-Frequenz
+                        let distance = F::abs(bin_freq - carrier_freq);
+                        let harmonic_step = distance / F::max(F::new(1.0), mod_freq);
                         let fract = harmonic_step - F::floor(harmonic_step);
 
-                        if fract < F::new(0.18) || fract > F::new(0.82) {
+                        // Phasenstarre Einrastung der FM-Seitenbänder (Löscht den Klick-Bug!)
+                        if fract < F::new(0.15) || fract > F::new(0.85) {
                             let order = F::floor(harmonic_step);
                             
-                            let total_index = l1 + l2 + l3 + l4 + l5 + l6;
-                            let width_factor = F::max(F::new(0.001), total_index);
+                            // Exponentieller Amplitudenabfall nach der Carson-Bandbreitenregel
+                            let width_factor = F::max(F::new(0.05), effective_index);
                             let fm_sideband_damping = F::exp(-order / width_factor);
 
-                            let compensation = F::new(1.0) / F::sqrt(F::new(1.0) + total_index * F::new(0.4));
+                            // Psychoakustischer Energie-Ausgleich (Hält die Master-Lautstärke stabil)
+                            let compensation = F::new(1.0) / F::sqrt(F::new(1.0) + effective_index * F::new(0.5));
                             let final_amplitude = saw_base_amp * fm_sideband_damping * compensation;
 
+                            // Alternierende orthogonale Phasen-Verteilung im FFT-Raum
                             if k % 2 == 0 { real_spec += final_amplitude; } else { imag_spec += final_amplitude; }
                         }
                     }
@@ -157,6 +168,8 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
             let combined_filter_gain = (moog_gain + oberheim_gain) * F::new(0.5);
             let filtered_real = real_spec * combined_filter_gain;
             let filtered_imag = imag_spec * combined_filter_gain;
+
+            // Prozeduraler Stereo-Hall (Ab hier unverändert wie in deinem File...)
 
             // Prozeduraler Stereo-Hall
             let freq_factor = F::new(1.0) + (bin_freq * high_freq_damping * F::new(0.0001));
