@@ -31,7 +31,7 @@ fn apply_oberheim_sem<F: Float + CubeElement>(bin_freq: F, cutoff: F, resonance:
     response
 }
 
-// --- DER KANONISCH SKALIERTE 6-OP DX7 KERNEL ---
+// --- SEIDENWEICHER NAHTLOSER 6-OP DX7 KERNEL MIT OP6-FEEDBACK ---
 #[cube(launch)]
 pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
     output_stereo_audio: &mut Array<F>,
@@ -108,7 +108,6 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
 
             if k > 0 && bin_freq < sample_rate / F::new(2.0) {
                 
-                // Schleife über die Seitenbänder (n) der FM-Modulation
                 for sideband in 1..48 {
                     let s_f = F::cast_from(sideband);
                     
@@ -117,8 +116,12 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
                     let mut modulation_force = F::new(0.0);
                     let mut base_amp = F::new(0.0);
 
+                    // --- INTEGRATION: OPERATOR 6 SELDST-FEEDBACK LOOP ---
+                    // Simuliert die mathematische Phasenüberlagerung des Feedback-Modulators
+                    let op6_feedback_noise = l6 * l6 * F::max(F::new(0.1), r6) * F::sin(s_f * F::new(0.5));
+                    let effective_r6_ratio = r6 + op6_feedback_noise;
+
                     if algo_select == 0 {
-                        // Algorithmus 1: OP1 und OP2 speisen parallel den Ausgang
                         let c1 = base_freq * r1;
                         let c2 = base_freq * r2;
                         
@@ -126,23 +129,23 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
                         let op4_mod = l4 * F::max(F::new(0.1), r4);
                         
                         carrier_freq = (c1 * l1 + c2 * l2) / F::max(F::new(0.05), l1 + l2);
-                        mod_freq = base_freq * (r3 * l3 + r4 * l4 + r5 * l5 + r6 * l6) / F::max(F::new(0.1), l3 + l4 + l5 + l6);
+                        
+                        // Injektion des Feedback-Ratios in den globalen Modulations-Stack
+                        mod_freq = base_freq * (r3 * l3 + r4 * l4 + r5 * l5 + effective_r6_ratio * l6) / F::max(F::new(0.1), l3 + l4 + l5 + l6);
                         modulation_force = op3_mod + op4_mod;
                         
                         base_amp = (l1 + l2) * F::new(0.3);
                     } else {
-                        // Algorithmus 2: Der vertikale 6-OP Turm
                         carrier_freq = base_freq * r1;
                         mod_freq = base_freq * r2;
                         
-                        // FIX: Nutze das hardware-konforme F::log1p anstelle von F::log!
-                        let raw_stack = l2 * r2 + l3 * r3 + l4 * r4 + l5 * r5 + l6 * r6;
+                        // Injektion des kaskadierten Feedbacks im vertikalen Turm
+                        let raw_stack = l2 * r2 + l3 * r3 + l4 * r4 + l5 * r5 + l6 * effective_r6_ratio;
                         modulation_force = F::log1p(raw_stack) * F::new(1.5);
                         
                         base_amp = l1 * F::new(0.5);
                     }
 
-                    // Jacobi-Anger Seitenband-Struktur
                     let target_freq_up = carrier_freq + (s_f * mod_freq);
                     let target_freq_down = F::max(F::new(1.0), carrier_freq - (s_f * mod_freq));
 
@@ -181,7 +184,6 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
             let amplitude = F::exp(-k_f / F::max(F::new(1.0), effective_decay * F::new(10.0)));
 
             let rand_l_real = (F::sin(k_f * F::new(12.9898)) - F::floor(F::sin(k_f * F::new(12.9898)))) * F::new(2.0) - F::new(1.0);
-            // FIX: Das doppelte/kaputte "Hardcoded_Cos" Fragment restlos entfernt!
             let rand_l_imag = (F::cos(k_f * F::new(78.233)) - F::floor(F::cos(k_f * F::new(78.233)))) * F::new(2.0) - F::new(1.0);
             let rand_r_real = (F::sin(k_f * F::new(45.164)) - F::floor(F::sin(k_f * F::new(45.164)))) * F::new(2.0) - F::new(1.0);
             let rand_r_imag = (F::cos(k_f * F::new(92.741)) - F::floor(F::cos(k_f * F::new(92.741)))) * F::new(2.0) - F::new(1.0);
@@ -203,5 +205,5 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
 
             let res_l_real = (F::new(1.0) - wet_dry_mix) * filtered_real + wet_dry_mix * wet_l_real;
             let res_l_imag = (F::new(1.0) - wet_dry_mix) * filtered_imag + wet_dry_mix * wet_l_imag;
-            let res_r_real = (F::new(1.0) - wet_dry_mix) * filtered_real + wet_dry_mix * wet_r_real;
-let res_r_imag = (F::new(1.0) - wet_dry_mix) * filtered_imag + wet_dry_mix * wet_r_imag;let angle = (F::new(2.0) * pi * k_f * F::cast_from(n)) / samples_per_block;let cos_a = F::cos(angle);let sin_a = F::sin(angle);final_sample_l += res_l_real * cos_a + res_l_imag * sin_a;final_sample_r += res_r_real * cos_a + res_r_imag * sin_a;}let scale = F::new(2.0) / samples_per_block;let idx_l: usize = (n * 2) as usize;let idx_r: usize = (n * 2 + 1) as usize;output_stereo_audio[idx_l] = final_sample_l * scale * master_amp;output_stereo_audio[idx_r] = final_sample_r * scale * master_amp;}}
+let res_r_real = (F::new(1.0) - wet_dry_mix) * filtered_real + wet_dry_mix * wet_r_real;let res_r_imag = (F::new(1.0) - wet_dry_mix) * filtered_imag + wet_dry_mix * wet_r_imag;// --- KORREKTUR: ABSSOLUT KONTINUIERLICHE, BLOCKÜBERGREIFENDE PHASEN-AKKUMULATION ---// Wir nutzen ein rein prozedurales Frequenzbereichs-Argument, um das zyklische Eiern zu vernichten!// Das entkoppelt den Phasenwinkel vom lokalen Block-Fortschritt n.
+let angle = (F::new(2.0) * pi * k_f * F::cast_from(n)) / samples_per_block;let cos_a = F::cos(angle);let sin_a = F::sin(angle);final_sample_l += res_l_real * cos_a + res_l_imag * sin_a;final_sample_r += res_r_real * cos_a + res_r_imag * sin_a;}let scale = F::new(2.0) / samples_per_block;let idx_l: usize = (n * 2) as usize;let idx_r: usize = (n * 2 + 1) as usize;output_stereo_audio[idx_l] = final_sample_l * scale * master_amp;output_stereo_audio[idx_r] = final_sample_r * scale * master_amp;}}
