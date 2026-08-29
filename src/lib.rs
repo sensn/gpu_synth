@@ -15,6 +15,7 @@ pub struct WebAudioEngine {
     last_frequency: Cell<f32>,
     last_cutoff: Cell<f32>,
     lfo_phase: Cell<f32>,
+    block_count: Cell<u32>,
 }
 
 #[wasm_bindgen]
@@ -27,6 +28,7 @@ impl WebAudioEngine {
             last_frequency: Cell::new(110.0),
             last_cutoff: Cell::new(800.0),
             lfo_phase: Cell::new(0.0),
+            block_count: Cell::new(0),
         }
     }
 
@@ -57,11 +59,9 @@ impl WebAudioEngine {
         let raw_bytes = cubecl::bytes::Bytes::from_bytes_vec(byte_vec);
         let handle_out = client.create(raw_bytes);
 
-        // Konvertiere die JavaScript-Typen-Arrays in native Rust-Slices
         let ratios_vec: Vec<f32> = js_ratios.to_vec();
         let levels_vec: Vec<f32> = js_levels.to_vec();
 
-        // Reserviere dedizierten VRAM auf der GPU für die DX7 Operator-Eigenschaften
         let bytes_ratios = cubecl::bytes::Bytes::from_bytes_vec(bytemuck::cast_slice(&ratios_vec).to_vec());
         let bytes_levels = cubecl::bytes::Bytes::from_bytes_vec(bytemuck::cast_slice(&levels_vec).to_vec());
         let handle_ratios = client.create(bytes_ratios);
@@ -77,28 +77,30 @@ impl WebAudioEngine {
         let old_freq = self.last_frequency.get();
         let old_cut = self.last_cutoff.get();
         let current_lfo_phase = self.lfo_phase.get();
+        let current_block_index = self.block_count.get();
 
-        // KORREKTUR: Reicht jetzt lückenlos alle 25 Argumente in der bit-perfekten Reihenfolge an die GPU weiter!
+        // FIX: Reicht jetzt lückenlos alle 26 Argumente in der korrekten Reihenfolge an die GPU weiter!
         cubek_true_stereo_synth_reverb::launch::<f32, WgpuRuntime>(
             &client, grid_dim, cube_dim, arg_audio,
             frequency, old_freq, 
             cutoff, old_cut,
             44100.0, current_lfo_phase,
-            arg_ratios, arg_levels, algo_select, // ◄ FIX: Allokierte VRAM Arrays eingebunden
+            arg_ratios, arg_levels, algo_select,
             moog_res, obe_res, obe_mode,
             lfo_freq, lfo_depth,
             room_size, high_freq_damping, wet_mix, stereo_width, 
             attack, decay,
-            self.fft_size,
+            current_block_index, // Mappt exakt auf Position 21 (u32 Runtime-Parameter)
+            self.fft_size,       // Mappt exakt auf Position 22 (#[comptime] fft_size)
         );
 
-        // Kontinuierliche Phasenfortführung für den knackfreien LFO-Gleitschutz
         let block_duration = (self.fft_size as f32) / 44100.0;
         let next_lfo_phase = current_lfo_phase + (2.0 * std::f32::consts::PI * lfo_freq * block_duration);
         self.lfo_phase.set(next_lfo_phase % (2.0 * std::f32::consts::PI));
 
         self.last_frequency.set(frequency);
         self.last_cutoff.set(cutoff);
+        self.block_count.set(current_block_index.wrapping_add(1));
 
         future_to_promise(async move {
             let result_bytes_res = client.read_async(vec![handle_out]).await;
