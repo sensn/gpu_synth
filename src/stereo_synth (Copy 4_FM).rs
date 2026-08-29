@@ -38,21 +38,30 @@ fn apply_oberheim_sem<F: Float + CubeElement>(bin_freq: F, cutoff: F, resonance:
     response
 }
 
-// --- DER HYBRIDE SÄGEZAHN / FM KERNEL ---
+// --- DER VOLLSTÄNDIG INTERAKTIVE SYNTHESIZER-KERNEL ---
 #[cube(launch)]
 pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
     output_stereo_audio: &mut Array<F>,
+    // 1. Synthesizer Basis-Register
     frequency: F, old_frequency: F,
     dyn_cutoff: F, old_cutoff: F,
     sample_rate: F,
     global_block_index: u32,
+    
+    // 2. FM-Modulations Parameter (NEU)
     fm_ratio: F,
     fm_index: F,
+    
+    // 3. Filterbank Feineinstellung (NEU)
     moog_resonance: F,
     oberheim_resonance: F,
     oberheim_mode: u32,
+    
+    // 4. LFO-Modulations Parameter (NEU)
     lfo_frequency: F,
     lfo_depth: F,
+    
+    // 5. Raumakustik & ADSR
     room_size_seconds: F,
     high_freq_damping: F,
     wet_dry_mix: F,
@@ -81,13 +90,16 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
             if adsr_amp < sustain_lvl { adsr_amp = sustain_lvl; }
         }
 
+        // LFO-Modulation mit dynamischer Slider-Geschwindigkeit
         let total_samples = (F::cast_from(global_block_index) * samples_per_block) + F::cast_from(n);
         let current_time = total_samples / sample_rate;
         let lfo_mod = F::sin(F::new(2.0) * pi * lfo_frequency * current_time);
 
+        // Slope Interpolation für Knackfreiheit
         let base_freq = old_frequency + (block_progress * (frequency - old_frequency));
         let base_cutoff = old_cutoff + (block_progress * (dyn_cutoff - old_cutoff));
         
+        // Dynamisch modulierter Cutoff über LFO-depth Slider
         let mut modulated_cutoff = base_cutoff + (lfo_mod * lfo_depth);
         if modulated_cutoff < F::new(50.0) { modulated_cutoff = F::new(50.0); }
 
@@ -100,47 +112,25 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
             let mut real_spec = F::new(0.0);
             let mut imag_spec = F::new(0.0);
 
+            // 1. DYNAMISCHE FM-GENERIERUNG IM SPEKTRALBEREICH
             if k > 0 && bin_freq < sample_rate / F::new(2.0) {
-                // Modulationsfrequenz berechnen
+                let carrier_freq = base_freq;
                 let mod_freq = base_freq * fm_ratio;
-
-                // --- ECHTE HYBRIDE SPEKTRAL-FM MIT SÄGEZAHN-RÜCKGRAT ---
-                // Schleife über die stärksten Harmonischen des Träger-Sägezahns (bis zu 32 Teiltöne)
-                for h in 1..33 {
-                    let h_f = F::cast_from(h);
-                    let carrier_harmonic_freq = base_freq * h_f;
-
-                    // Wenn die Grundharmonische die Nyquist-Grenze überschreitet, brechen wir ab (Bandlimiting)
-                    if carrier_harmonic_freq < sample_rate / F::new(2.0) {
-                        
-                        // Amplitude des unmodulierten Sägezahns (1/h)
-                        let saw_base_amp = F::new(1.0) / h_f;
-
-                        // Berechne den Abstand des aktuellen Bins zu DIESER Harmonischen
-                        let distance_to_harmonic = F::abs(bin_freq - carrier_harmonic_freq);
-                        let harmonic_step = distance_to_harmonic / mod_freq;
-                        let fract = harmonic_step - F::floor(harmonic_step);
-
-                        // Wenn das Bin auf ein FM-Seitenband dieser Sägezahn-Harmonischen fällt
-                        if fract < F::new(0.15) || fract > F::new(0.85) {
-                            let order = F::floor(harmonic_step);
-                            
-                            // Fusion: Sägezahn-Grundamplitude (1/h) skaliert mit der FM-Modulationsdämpfung
-                            let fm_sideband_damping = F::new(1.0) / (F::new(1.0) + order * order * F::max(F::new(0.1), F::new(11.0) - fm_index));
-                            let final_amplitude = saw_base_amp * fm_sideband_damping * F::max(F::new(0.2), fm_index * F::new(0.5));
-
-                            // Symmetrische Phasen-Verteilung
-                            if k % 2 == 0 {
-                                real_spec += final_amplitude;
-                            } else {
-                                imag_spec += final_amplitude;
-                            }
-                        }
-                    }
+                
+                let distance_to_carrier = F::abs(bin_freq - carrier_freq);
+                let harmonic_step = distance_to_carrier / mod_freq;
+                let fract = harmonic_step - F::floor(harmonic_step);
+                
+                if fract < F::new(0.15) || fract > F::new(0.85) {
+                    let order = F::floor(harmonic_step);
+                    // Amplitudenskalierung über den interaktiven fm_index Slider
+                    let sideband_amplitude = fm_index / (F::new(1.0) + order * order);
+                    
+                    if k % 2 == 0 { real_spec = sideband_amplitude; } else { imag_spec = sideband_amplitude; }
                 }
             }
 
-            // 2. PARALLELE FILTERBANK FUSION
+            // 2. PARALLELE FILTERBANK FUSION MIT DYNAMISCHEN RECONANCE-SLIDERN
             let moog_gain: F = apply_moog_ladder::<F>(bin_freq, modulated_cutoff, moog_resonance);
             let oberheim_gain: F = apply_oberheim_sem::<F>(bin_freq, modulated_cutoff, oberheim_resonance, oberheim_mode); 
 
