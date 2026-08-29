@@ -14,7 +14,7 @@ pub struct WebAudioEngine {
     fft_size: u32,
     last_frequency: Cell<f32>,
     last_cutoff: Cell<f32>,
-    block_counter: Cell<u32>,
+    lfo_phase: Cell<f32>,
 }
 
 #[wasm_bindgen]
@@ -26,7 +26,7 @@ impl WebAudioEngine {
             fft_size: 2048,
             last_frequency: Cell::new(110.0),
             last_cutoff: Cell::new(800.0),
-            block_counter: Cell::new(0),
+            lfo_phase: Cell::new(0.0),
         }
     }
 
@@ -40,7 +40,6 @@ impl WebAudioEngine {
         })
     }
 
-    // VOLLSTÄNDIGE HARDWARE SIGNATUR: Mappt alle UI-Parameter direkt an die GPU-Register
     pub fn render_block_async(
         &self, 
         frequency: f32, cutoff: f32, room_size: f32, wet_mix: f32, attack: f32, decay: f32,
@@ -61,12 +60,13 @@ impl WebAudioEngine {
 
         let old_freq = self.last_frequency.get();
         let old_cut = self.last_cutoff.get();
-        let current_block = self.block_counter.get();
+        let current_lfo_phase = self.lfo_phase.get();
 
         cubek_true_stereo_synth_reverb::launch::<f32, WgpuRuntime>(
             &client, grid_dim, cube_dim, array_arg,
             frequency, old_freq, cutoff, old_cut,
-            44100.0, current_block,
+            44100.0, 
+            current_lfo_phase, 
             fm_ratio, fm_index,
             moog_res, obe_res, obe_mode,
             lfo_freq, lfo_depth,
@@ -75,9 +75,12 @@ impl WebAudioEngine {
             self.fft_size,
         );
 
+        let block_duration = (self.fft_size as f32) / 44100.0;
+        let next_lfo_phase = current_lfo_phase + (2.0 * std::f32::consts::PI * lfo_freq * block_duration);
+        self.lfo_phase.set(next_lfo_phase % (2.0 * std::f32::consts::PI));
+
         self.last_frequency.set(frequency);
         self.last_cutoff.set(cutoff);
-        self.block_counter.set(current_block + 1);
 
         future_to_promise(async move {
             let result_bytes_res = client.read_async(vec![handle_out]).await;

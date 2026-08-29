@@ -38,20 +38,20 @@ fn apply_oberheim_sem<F: Float + CubeElement>(bin_freq: F, cutoff: F, resonance:
     response
 }
 
-// --- DER ENERGIE-NORMALISIERTE HYBRIDE RECHEN KERNEL ---
+// --- DER KLANGLICH PERFEKTE HYBRIDE RECHEN KERNEL ---
 #[cube(launch)]
 pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
     output_stereo_audio: &mut Array<F>,
     frequency: F, old_frequency: F,
     dyn_cutoff: F, old_cutoff: F,
     sample_rate: F,
-    global_block_index: u32,
+    lfo_accumulated_phase: F,
     fm_ratio: F,
     fm_index: F,
     moog_resonance: F,
     oberheim_resonance: F,
     oberheim_mode: u32,
-    lfo_frequency: F,
+    lfo_frequency: F, 
     lfo_depth: F,
     room_size_seconds: F,
     high_freq_damping: F,
@@ -69,22 +69,29 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
         let pi = F::new(std::f32::consts::PI);
         let samples_per_block = F::cast_from(fft_size);
         
+        // Realtime ADSR Block-Trigger Modulation
         let block_progress = F::cast_from(n) / samples_per_block;
         let sustain_lvl = F::new(0.6);
         let mut adsr_amp = F::new(1.0);
 
         if attack_time > F::new(0.05) {
-            adsr_amp = block_progress / attack_time;
+            adsr_amp = block_progress * (F::new(2.1) - attack_time);
             if adsr_amp > F::new(1.0) { adsr_amp = F::new(1.0); }
-        } else if decay_time > F::new(0.05) {
-            adsr_amp = F::new(1.0) - (block_progress * decay_time * (F::new(1.0) - sustain_lvl));
-            if adsr_amp < sustain_lvl { adsr_amp = sustain_lvl; }
+        } 
+        
+        // EXAKTER FIX: "F::0.05" zu "F::new(0.05)" korrigiert!
+        if decay_time > F::new(0.05) {
+            let decay_factor = block_progress * decay_time * (F::new(1.0) - sustain_lvl);
+            let mut current_decay_amp = F::new(1.0) - decay_factor;
+            if current_decay_amp < sustain_lvl { current_decay_amp = sustain_lvl; }
+            if current_decay_amp < adsr_amp { adsr_amp = current_decay_amp; }
         }
 
-        let total_samples = (F::cast_from(global_block_index) * samples_per_block) + F::cast_from(n);
-        let current_time = total_samples / sample_rate;
-        let lfo_mod = F::sin(F::new(2.0) * pi * lfo_frequency * current_time);
+        // LFO via akkumulierter Host-Phase
+        let sample_phase_delta = (F::new(2.0) * pi * lfo_frequency * block_progress * samples_per_block) / sample_rate;
+        let lfo_mod = F::sin(lfo_accumulated_phase + sample_phase_delta);
 
+        // Slider-Glättung (Slope Interpolation)
         let base_freq = old_frequency + (block_progress * (frequency - old_frequency));
         let base_cutoff = old_cutoff + (block_progress * (dyn_cutoff - old_cutoff));
         
@@ -103,7 +110,7 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
             if k > 0 && bin_freq < sample_rate / F::new(2.0) {
                 let mod_freq = base_freq * fm_ratio;
 
-                // Loop über die stärksten Harmonischen des Träger-Sägezahns
+                // Spektrale Hybrid-FM mit Sägezahn-Rückgrat
                 for h in 1..33 {
                     let h_f = F::cast_from(h);
                     let carrier_harmonic_freq = base_freq * h_f;
@@ -112,27 +119,19 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
                         let saw_base_amp = F::new(1.0) / h_f;
 
                         let distance_to_harmonic = F::abs(bin_freq - carrier_harmonic_freq);
-                        
-                        // KORREKTOR: Nutze die deklarierte Variable distance_to_harmonic statt distance_to_carrier
                         let harmonic_step = distance_to_harmonic / mod_freq;
                         let fract = harmonic_step - F::floor(harmonic_step);
 
                         if fract < F::new(0.18) || fract > F::new(0.82) {
                             let order = F::floor(harmonic_step);
                             
-                            // Dynamische Flanken-Öffnung basierend auf dem Modulationsindex
                             let width_factor = F::max(F::new(0.001), fm_index);
                             let fm_sideband_damping = F::exp(-order / width_factor);
 
-                            // Pegel-Kompensation hält die Gesamtlautstärke stabil
                             let compensation = F::new(1.0) / F::sqrt(F::new(1.0) + fm_index * F::new(0.5));
                             let final_amplitude = saw_base_amp * fm_sideband_damping * compensation;
 
-                            if k % 2 == 0 {
-                                real_spec += final_amplitude;
-                            } else {
-                                imag_spec += final_amplitude;
-                            }
+                            if k % 2 == 0 { real_spec += final_amplitude; } else { imag_spec += final_amplitude; }
                         }
                     }
                 }
