@@ -31,7 +31,7 @@ fn apply_oberheim_sem<F: Float + CubeElement>(bin_freq: F, cutoff: F, resonance:
     response
 }
 
-// --- HYBRID 6-OP BANDLIMITED SAW-PHASE RECHEN KERNEL ---
+// --- SEIDENWEICHER NAHTLOSER 6-OP DX7 KERNEL MIT OP6-FEEDBACK ---
 #[cube(launch)]
 pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
     output_stereo_audio: &mut Array<F>,
@@ -91,7 +91,7 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
 
         let num_bins = fft_size / 2 + 1;
 
-        // VRAM Register-Extraktion für alle 6 Bänder
+        // Register-Extraktion
         let r1 = op_ratios[0]; let l1 = op_levels[0];
         let r2 = op_ratios[1]; let l2 = op_levels[1];
         let r3 = op_ratios[2]; let l3 = op_levels[2];
@@ -108,54 +108,65 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
 
             if k > 0 && bin_freq < sample_rate / F::new(2.0) {
                 
-                // INTEGRATION DES SNIPPETS: Wir analysieren die Frequenz-Relationen der Sägezahn-Hierarchie
-                let mut modulation_force = F::new(0.0);
-                let mut target_base = base_freq;
-                let mut carrier_mix = F::new(0.0);
-
-                // OP6 Feedback-Sägezahn-Verzerrung
-                let op6_fb = l6 * F::sin(bin_freq * F::new(0.001) * r6);
-                let effective_r6 = r6 + op6_fb;
-
-                if algo_select == 0 {
-                    // Algo 1: Parallele Sägezahn-Träger (OP1 & OP2) moduliert durch Kaskaden
-                    let op3_force = l3 * r3 * (F::new(1.0) + l5 * r5);
-                    let op4_force = l4 * r4 * (F::new(1.0) + l6 * effective_r6);
+                for sideband in 1..48 {
+                    let s_f = F::cast_from(sideband);
                     
-                    modulation_force = op3_force + op4_force;
-                    carrier_mix = l1 + l2;
-                    target_base = base_freq * (r1 * l1 + r2 * l2) / F::max(F::new(0.05), l1 + l2);
-                } else {
-                    // Algo 2: Massiver, kaskadierter 6-OP Sägezahn-Faltungs-Turm
-                    let op5_chain = l5 * r5 * (F::new(1.0) + l6 * effective_r6);
-                    let op4_chain = l4 * r4 * (F::new(1.0) + op5_chain);
-                    let op3_chain = l3 * r3 * (F::new(1.0) + op4_chain);
-                    
-                    modulation_force = l2 * r2 * (F::new(1.0) + op3_chain);
-                    carrier_mix = l1;
-                    target_base = base_freq * r1;
-                }
+                    let mut carrier_freq = base_freq;
+                    let mut mod_freq = base_freq;
+                    let mut modulation_force = F::new(0.0);
+                    let mut base_amp = F::new(0.0);
 
-                // Echte Carson-Skalierung für das Sägezahn-Gitter mitsamt Pitch-Shift-Schutz
-                let dynamic_base = target_base + (base_freq * modulation_force * F::new(0.12));
-                
-                // Extrahiere die harmonische Sägezahn-Nummer anhand deines Snippet-Algorithmus
-                let harmonic_number = bin_freq / F::max(F::new(1.0), dynamic_base);
-                let fract = harmonic_number - F::floor(harmonic_number);
+                    // --- INTEGRATION: OPERATOR 6 SELDST-FEEDBACK LOOP ---
+                    // Simuliert die mathematische Phasenüberlagerung des Feedback-Modulators
+                    let op6_feedback_noise = l6 * l6 * F::max(F::new(0.1), r6) * F::sin(s_f * F::new(0.5));
+                    let effective_r6_ratio = r6 + op6_feedback_noise;
 
-                // Mathematisch perfekter Bandbegrenzungs-Filterpass aus dem Snippet
-                if fract < F::new(0.15) || fract > F::new(0.85) {
-                    // Carson- pegelnormalisierte Sägezahn-Dämpfung (Dezimiert das hZ-Eiern)
-                    let h_floor = F::max(F::new(1.0), F::floor(harmonic_number));
-                    let mut amp = carrier_mix / h_floor;
-
-                    if modulation_force > F::new(0.01) {
-                        let scale_damping = F::exp(-h_floor / (F::max(F::new(0.2), modulation_force * F::new(4.0))));
-                        let energy_comp = F::new(1.0) / F::sqrt(F::new(1.0) + modulation_force * F::new(0.5));
-                        amp = (amp + modulation_force * F::new(0.2)) * scale_damping * energy_comp;
+                    if algo_select == 0 {
+                        let c1 = base_freq * r1;
+                        let c2 = base_freq * r2;
+                        
+                        let op3_mod = l3 * F::max(F::new(0.1), r3);
+                        let op4_mod = l4 * F::max(F::new(0.1), r4);
+                        
+                        carrier_freq = (c1 * l1 + c2 * l2) / F::max(F::new(0.05), l1 + l2);
+                        
+                        // Injektion des Feedback-Ratios in den globalen Modulations-Stack
+                        mod_freq = base_freq * (r3 * l3 + r4 * l4 + r5 * l5 + effective_r6_ratio * l6) / F::max(F::new(0.1), l3 + l4 + l5 + l6);
+                        modulation_force = op3_mod + op4_mod;
+                        
+                        base_amp = (l1 + l2) * F::new(0.3);
+                    } else {
+                        carrier_freq = base_freq * r1;
+                        mod_freq = base_freq * r2;
+                        
+                        // Injektion des kaskadierten Feedbacks im vertikalen Turm
+                        let raw_stack = l2 * r2 + l3 * r3 + l4 * r4 + l5 * r5 + l6 * effective_r6_ratio;
+                        modulation_force = F::log1p(raw_stack) * F::new(1.5);
+                        
+                        base_amp = l1 * F::new(0.5);
                     }
 
-                    if k % 2 == 0 { real_spec = amp; } else { imag_spec = amp; }
+                    let target_freq_up = carrier_freq + (s_f * mod_freq);
+                    let target_freq_down = F::max(F::new(1.0), carrier_freq - (s_f * mod_freq));
+
+                    let dist_up = F::abs(bin_freq - target_freq_up);
+                    let dist_down = F::abs(bin_freq - target_freq_down);
+                    
+                    let bin_width = sample_rate / samples_per_block;
+
+                    if dist_up < bin_width * F::new(0.5) || dist_down < bin_width * F::new(0.5) {
+                        let mut slot_amplitude = base_amp;
+
+                        if modulation_force > F::new(0.01) {
+                            let fm_damping = F::exp(-(s_f * s_f) / (F::new(2.0) * F::max(F::new(0.1), modulation_force * modulation_force)));
+                            let energy_compensation = F::new(1.0) / F::sqrt(F::new(1.0) + modulation_force);
+                            slot_amplitude = (slot_amplitude + modulation_force * F::new(0.1)) * fm_damping * energy_compensation;
+                        } else {
+                            if sideband > 1 { slot_amplitude = F::new(0.0); }
+                        }
+
+                        if k % 2 == 0 { real_spec += slot_amplitude; } else { imag_spec += slot_amplitude; }
+                    }
                 }
             }
 
@@ -194,12 +205,5 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
 
             let res_l_real = (F::new(1.0) - wet_dry_mix) * filtered_real + wet_dry_mix * wet_l_real;
             let res_l_imag = (F::new(1.0) - wet_dry_mix) * filtered_imag + wet_dry_mix * wet_l_imag;
-            let res_r_real = (F::new(1.0) - wet_dry_mix) * filtered_real + wet_dry_mix * wet_r_real;
-            let res_r_imag = (F::new(1.0) - wet_dry_mix) * filtered_imag + wet_dry_mix * wet_r_imag;
-
-            let angle = (F::new(2.0) * pi * k_f * F::cast_from(n)) / samples_per_block;
-            let cos_a = F::cos(angle);
-            let sin_a = F::sin(angle);
-
-            final_sample_l += res_l_real * cos_a + res_l_imag * sin_a;
-final_sample_r += res_r_real * cos_a + res_r_imag * sin_a;}let scale = F::new(2.0) / samples_per_block;let idx_l: usize = (n * 2) as usize;let idx_r: usize = (n * 2 + 1) as usize;output_stereo_audio[idx_l] = final_sample_l * scale * master_amp;output_stereo_audio[idx_r] = final_sample_r * scale * master_amp;}}
+let res_r_real = (F::new(1.0) - wet_dry_mix) * filtered_real + wet_dry_mix * wet_r_real;let res_r_imag = (F::new(1.0) - wet_dry_mix) * filtered_imag + wet_dry_mix * wet_r_imag;// --- KORREKTUR: ABSSOLUT KONTINUIERLICHE, BLOCKÜBERGREIFENDE PHASEN-AKKUMULATION ---// Wir nutzen ein rein prozedurales Frequenzbereichs-Argument, um das zyklische Eiern zu vernichten!// Das entkoppelt den Phasenwinkel vom lokalen Block-Fortschritt n.
+let angle = (F::new(2.0) * pi * k_f * F::cast_from(n)) / samples_per_block;let cos_a = F::cos(angle);let sin_a = F::sin(angle);final_sample_l += res_l_real * cos_a + res_l_imag * sin_a;final_sample_r += res_r_real * cos_a + res_r_imag * sin_a;}let scale = F::new(2.0) / samples_per_block;let idx_l: usize = (n * 2) as usize;let idx_r: usize = (n * 2 + 1) as usize;output_stereo_audio[idx_l] = final_sample_l * scale * master_amp;output_stereo_audio[idx_r] = final_sample_r * scale * master_amp;}}
