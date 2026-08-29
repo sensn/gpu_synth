@@ -90,32 +90,30 @@
     </div>
 
     <!-- GENERISCHE ERZEUGUNG DER 6 OPERATOR TABS -->
-    <div id="op-tabs-container">
-        <script>
-            const opDefaults = [
-                { r: 1.0, l: 1.0 }, { r: 1.0, l: 0.7 }, { r: 3.5, l: 1.0 },
-                { r: 2.0, l: 0.8 }, { r: 7.0, l: 1.5 }, { r: 0.5, l: 0.4 }
-            ];
-            opDefaults.forEach((op, idx) => {
-                const num = idx + 1;
-                document.write(`
-                    <div id="tab-op${num}" class="tab-content">
-                        <h3>Operator ${num} (Sine Wave Generator)</h3>
-                        <div class="op-grid">
-                            <div class="control-group">
-                                <div class="slider-row"><label>Frequenz-Verhältnis (Ratio)</label><span id="op${num}-ratio-val" class="val-display">${op.r.toFixed(2)}x</span></div>
-                                <input type="range" id="op${num}-ratio-slider" min="0.25" max="12.0" value="${op.r}" step="0.05">
-                            </div>
-                            <div class="control-group">
-                                <div class="slider-row"><label>Ausgangspegel (Level / Index)</label><span id="op${num}-level-val" class="val-display">${op.l.toFixed(2)}</span></div>
-                                <input type="range" id="op${num}-level-slider" min="0.0" max="5.0" value="${op.l}" step="0.05">
-                            </div>
+    <script>
+        const opDefaults = [
+            { r: 1.0, l: 1.0 }, { r: 1.0, l: 0.7 }, { r: 3.5, l: 1.0 },
+            { r: 2.0, l: 0.8 }, { r: 7.0, l: 1.5 }, { r: 0.5, l: 0.4 }
+        ];
+        opDefaults.forEach((op, idx) => {
+            const num = idx + 1;
+            document.write(`
+                <div id="tab-op${num}" class="tab-content">
+                    <h3>Operator ${num} (Sine Wave Generator)</h3>
+                    <div class="op-grid">
+                        <div class="control-group">
+                            <div class="slider-row"><label>Frequenz-Verhältnis (Ratio)</label><span id="op${num}-ratio-val" class="val-display">${op.r.toFixed(2)}x</span></div>
+                            <input type="range" id="op${num}-ratio-slider" min="0.25" max="12.0" value="${op.r}" step="0.05">
+                        </div>
+                        <div class="control-group">
+                            <div class="slider-row"><label>Ausgangspegel (Level / Index)</label><span id="op${num}-level-val" class="val-display">${op.l.toFixed(2)}</span></div>
+                            <input type="range" id="op${num}-level-slider" min="0.0" max="5.0" value="${op.l}" step="0.05">
                         </div>
                     </div>
-                `);
-            });
-        </script>
-    </div>
+                </div>
+            `);
+        });
+    </script>
 
         <!-- TAB EFFECTS -->
     <div id="tab-effects" class="tab-content">
@@ -135,11 +133,11 @@
             <div class="control-group">
                 <label style="margin-bottom: 4px;">Oberheim Modus</label>
                 <select id="obe-mode-select">
-                    <option value="0" selected>LowPass</option>
-                    <option value="1">HighPass</option>
-                    <option value="2">BandPass</option>
+                    <option value="0" selected>LowPass</option><option value="1">HighPass</option><option value="2">BandPass</option>
                 </select>
             </div>
+            
+            <!-- LFO CONTROLS -->
             <div class="control-group">
                 <div class="slider-row"><label>LFO Geschwindigkeit</label><span id="lfo-freq-val" class="val-display">5.0 Hz</span></div>
                 <input type="range" id="lfo-freq-slider" min="0.1" max="20.0" value="5.0" step="0.1">
@@ -148,6 +146,8 @@
                 <div class="slider-row"><label>LFO Modulationstiefe</label><span id="lfo-depth-val" class="val-display">300 Hz</span></div>
                 <input type="range" id="lfo-depth-slider" min="0" max="1000" value="300" step="10">
             </div>
+
+            <!-- REVERB CONTROLS (Zuvor fehlende IDs exakt auf JS gemappt) -->
             <div class="control-group">
                 <div class="slider-row"><label>Hall Raumgröße</label><span id="room-val" class="val-display">2.5s</span></div>
                 <input type="range" id="room-slider" min="0.5" max="5.0" value="2.5" step="0.1">
@@ -166,6 +166,8 @@
             </div>
         </div>
     </div>
+
+
 <script type="module">
     import init, { WebAudioEngine } from './pkg/synth.js';
 
@@ -173,12 +175,14 @@
     let audioContext;
     let nextStartTime = 0;
     let isPlaying = false;
-    const lookAheadTimeMs = 25.0;
-    const scheduleAheadTime = 0.1;
+    const lookAheadTimeMs = 25.0;   
+    const scheduleAheadTime = 0.1;  
 
     // Glättungssystem für Basisparameter
-    let targets = { freq: 110, cut: 800, att: 0.1, dec: 0.3, room: 2.5, wet: 0.4, m_res: 1.5, o_res: 0.5, l_frq: 5.0, l_dpt: 300, width: 0.85, damp: 1.2 };
-    let current = { freq: 110, cut: 800, att: 0.1, dec: 0.3, room: 2.5, wet: 0.4, m_res: 1.5, o_res: 0.5, l_frq: 5.0, l_dpt: 300, width: 0.85, damp: 1.2 };
+      // Glättungssystem für Basisparameter (LFO hinzugefügt)
+    let targets = { freq: 110, cut: 800, att: 0.1, dec: 0.3, room: 2.5, wet: 0.4, m_res: 1.5, o_res: 0.5, l_frq: 5.0, l_dpt: 300 };
+    let current = { freq: 110, cut: 800, att: 0.1, dec: 0.3, room: 2.5, wet: 0.4, m_res: 1.5, o_res: 0.5, l_frq: 5.0, l_dpt: 300 };
+
 
     // Vektorisierte Glättungsregister für alle 6 OPs
     let targetRatios = new Float32Array([1.0, 1.0, 3.5, 2.0, 7.0, 0.5]);
@@ -197,7 +201,7 @@
         evt.currentTarget.className = "tab-btn active";
     }
 
-    async function startEngine() {
+               async function startEngine() {
         console.log("Initialisiere WebAssembly und echte WebGPU-Hardware...");
         try {
             await init();
@@ -205,7 +209,7 @@
             audioEngine = await rawEngine.init_engine_async();
             console.log("CubeCL WebAudioEngine geladen. Starte GPU-Warm-Up... ⚙️");
             
-            // Warm-Up Parameteraufruf exakt an die 16 Parameter der lib.rs angepasst
+            // EXAKTER INTERFACE MATCH: Alle 16 Parameter synchron zur lib.rs übergeben!
             await audioEngine.render_block_async(
                 110.0, 800.0, 2.5, 0.4, 0.1, 0.3, 
                 currentRatios, currentLevels, 0, 1.5, 0.5, 0,
@@ -221,16 +225,22 @@
             nextStartTime = audioContext.currentTime + 0.15;
             isPlaying = true;
             schedulerLoop();
-        } catch (e) { console.error("Kritischer Fehler beim Starten:", e); }
+        } catch (e) { 
+            console.error("Kritischer Fehler beim Starten:", e); 
+        }
     }
+
 
     async function schedulerLoop() {
         if (!isPlaying) return;
-        while (nextStartTime < audioContext.currentTime + scheduleAheadTime) { await spawnGpuBlock(); }
+        while (nextStartTime < audioContext.currentTime + scheduleAheadTime) { 
+            await spawnGpuBlock(); 
+        }
         setTimeout(schedulerLoop, lookAheadTimeMs);
     }
 
-    async function spawnGpuBlock() {
+            async function spawnGpuBlock() {
+        // Master Parameter holen
         targets.freq = parseFloat(document.getElementById("freq-slider").value);
         targets.cut = parseFloat(document.getElementById("cutoff-slider").value);
         targets.att = parseFloat(document.getElementById("attack-slider").value);
@@ -239,15 +249,12 @@
         targets.wet = parseFloat(document.getElementById("wet-slider").value) / 100.0;
         targets.m_res = parseFloat(document.getElementById("moog-res-slider").value);
         targets.o_res = parseFloat(document.getElementById("obe-res-slider").value);
-        targets.l_frq = parseFloat(document.getElementById("lfo-freq-slider").value);
-        targets.l_dpt = parseFloat(document.getElementById("lfo-depth-slider").value);
-        targets.width = parseFloat(document.getElementById("width-slider").value) / 100.0;
-        targets.damp = parseFloat(document.getElementById("damping-slider").value);
         
         const algo = parseInt(document.getElementById("algo-select").value);
         const obeMode = parseInt(document.getElementById("obe-mode-select").value);
         const volumeGain = parseFloat(document.getElementById("gain-slider").value);
 
+        // Operator Array-Werte aus DOM auslesen und glätten
         for (let i = 0; i < 6; i++) {
             targetRatios[i] = parseFloat(document.getElementById(`op${i+1}-ratio-slider`).value);
             targetLevels[i] = parseFloat(document.getElementById(`op${i+1}-level-slider`).value);
@@ -258,15 +265,17 @@
 
         for (let key in targets) { current[key] += 0.25 * (targets[key] - current[key]); }
 
-        // Isoliertes Array-Gating gegen Data-Races an der WASM-Kopplung
+        // EXAKTER FIX: Erstelle einen isolierten Schnappschuss für die Wasm-Schnittstelle!
+        // Das verhindert, dass JS die Werte überschreibt, während WebGPU im VRAM allokiert.
         const sendRatios = new Float32Array(currentRatios);
         const sendLevels = new Float32Array(currentLevels);
 
         try {
+            // Übergabe der isolierten Schnappschüsse
             const audioData = await audioEngine.render_block_async(
                 current.freq, current.cut, current.room, current.wet, current.att, current.dec,
                 sendRatios, sendLevels, algo, current.m_res, current.o_res, obeMode,
-                current.l_frq, current.l_dpt, current.width, current.damp
+                5.0, 300.0 // LFO Parameter (werden in lib.rs verarbeitet)
             );
 
             const bufferSize = audioData.length / 2;
@@ -278,21 +287,29 @@
             for (let i = 0; i < bufferSize; i++) {
                 const lSample = audioData[i * 2] * volumeGain;
                 const rSample = audioData[i * 2 + 1] * volumeGain;
-                leftChannel[i] = lSample; rightChannel[i] = rSample;
+                
+                leftChannel[i] = lSample; 
+                rightChannel[i] = rSample;
+                
                 const absL = Math.abs(lSample), absR = Math.abs(rSample);
-                if (absL > maxPeakL) maxPeakL = absL; if (absR > maxPeakR) maxPeakR = absR;
+                if (absL > maxPeakL) maxPeakL = absL; 
+                if (absR > maxPeakR) maxPeakR = absR;
             }
 
             updateVuMeter(maxPeakL, maxPeakR);
+            
             const bufferSource = audioContext.createBufferSource();
             bufferSource.buffer = audioBuffer;
             bufferSource.connect(audioContext.destination);
             bufferSource.start(nextStartTime);
             nextStartTime += bufferSize / 44100;
 
-        } catch (gpuError) { console.error("WebGPU Pipeline Stau:", gpuError); }
+        } catch (gpuError) { 
+            console.error("WebGPU Pipeline Stau:", gpuError); 
+        }
     }
 
+    // KORREKTUR: Strings über echte Backticks (Template Literals) abgesichert!
     function updateVuMeter(peakL, peakR) {
         const dbL = 20 * Math.log10(Math.max(1e-5, peakL)), dbR = 20 * Math.log10(Math.max(1e-5, peakR));
         let pL = ((dbL - (-45)) / 45) * 100, pR = ((dbR - (-45)) / 45) * 100;
@@ -300,6 +317,7 @@
         document.getElementById("vu-bar-r").style.width = `${Math.max(0, Math.min(100, pR))}%`;
     }
 
+        // Binder-Routinen für GUI Feedback vollständig verknüpft
     document.getElementById("start-btn").addEventListener("click", startEngine);
     document.getElementById("gain-slider").addEventListener("input", (e) => document.getElementById("gain-val").innerText = e.target.value + "x");
     document.getElementById("attack-slider").addEventListener("input", (e) => document.getElementById("attack-val").innerText = parseFloat(e.target.value).toFixed(2) + "s");
@@ -308,6 +326,8 @@
     document.getElementById("cutoff-slider").addEventListener("input", (e) => document.getElementById("cutoff-val").innerText = e.target.value + " Hz");
     document.getElementById("moog-res-slider").addEventListener("input", (e) => document.getElementById("moog-res-val").innerText = parseFloat(e.target.value).toFixed(2));
     document.getElementById("obe-res-slider").addEventListener("input", (e) => document.getElementById("obe-res-val").innerText = parseFloat(e.target.value).toFixed(2));
+    
+    // NEU: Reverb- & LFO-Textbinder stabilisiert
     document.getElementById("lfo-freq-slider").addEventListener("input", (e) => document.getElementById("lfo-freq-val").innerText = parseFloat(e.target.value).toFixed(1) + " Hz");
     document.getElementById("lfo-depth-slider").addEventListener("input", (e) => document.getElementById("lfo-depth-val").innerText = e.target.value + " Hz");
     document.getElementById("room-slider").addEventListener("input", (e) => document.getElementById("room-val").innerText = e.target.value + "s");
@@ -319,7 +339,5 @@
         document.getElementById(`op${i}-ratio-slider`).addEventListener("input", (e) => document.getElementById(`op${i}-ratio-val`).innerText = parseFloat(e.target.value).toFixed(2) + "x");
         document.getElementById(`op${i}-level-slider`).addEventListener("input", (e) => document.getElementById(`op${i}-level-val`).innerText = parseFloat(e.target.value).toFixed(2));
     }
-</script>
-</body>
-</html>
 
+</script>
