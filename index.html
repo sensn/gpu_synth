@@ -2,83 +2,139 @@
 <html lang="de">
 <head>
     <meta charset="UTF-8">
-    <title>CubeCL WebGPU Audio Synthesizer</title>
+    <title>CubeCL WebGPU Super-Synth Dashboard</title>
     <style>
-        body { font-family: sans-serif; background: #121212; color: #fff; padding: 40px; }
-        .control-group { margin-bottom: 20px; }
-        label { display: inline-block; width: 180px; }
-        button { padding: 10px 20px; font-size: 16px; background: #00ffcc; border: none; cursor: pointer; color: #000; font-weight: bold; }
-        button:disabled { background: #555; color: #aaa; cursor: not-allowed; }
+        body { font-family: sans-serif; background: #0c0c0c; color: #fff; padding: 30px; margin: 0; }
+        h1 { color: #00ffcc; margin-top: 0; text-transform: uppercase; font-size: 22px; letter-spacing: 2px; }
+        .dashboard { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 20px; margin-top: 25px; }
+        .panel { background: #141414; padding: 20px; border-radius: 8px; border: 1px solid #252525; }
+        .panel h2 { font-size: 14px; color: #00ffcc; text-transform: uppercase; margin-top: 0; margin-bottom: 15px; letter-spacing: 1px; border-bottom: 1px solid #222; padding-bottom: 5px; }
+        .control-group { margin-bottom: 12px; display: flex; flex-direction: column; }
+        .control-group:last-child { margin-bottom: 0; }
+        .slider-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+        label { font-size: 12px; color: #aaa; font-weight: bold; }
+        .val-display { font-size: 12px; color: #00ffcc; font-family: monospace; font-weight: bold; }
+        input[type="range"] { width: 100%; background: #222; accent-color: #00ffcc; cursor: pointer; }
+        select { background: #222; color: #00ffcc; border: 1px solid #333; padding: 5px; font-weight: bold; cursor: pointer; border-radius: 4px; }
+        button { padding: 12px 24px; font-size: 14px; background: #00ffcc; border: none; cursor: pointer; color: #000; font-weight: bold; border-radius: 4px; text-transform: uppercase; letter-spacing: 1px; }
+        button:disabled { background: #333; color: #777; cursor: not-allowed; }
         
-        /* VU-METER STYLING */
-        .vu-container { background: #1a1a1a; padding: 15px; border-radius: 8px; width: 350px; margin-bottom: 25px; border: 1px solid #333; }
-        .vu-row { display: flex; align-items: center; margin-bottom: 8px; }
-        .vu-row:last-child { margin-bottom: 0; }
-        .vu-label { width: 30px; font-size: 12px; color: #888; font-weight: bold; }
-        .vu-track { flex-grow: 1; height: 12px; background: #222; border-radius: 3px; overflow: hidden; position: relative; }
-        .vu-bar { height: 100%; width: 0%; background: linear-gradient(to right, #00ffcc 70%, #ffcc00 85%, #ff3333 100%); transition: width 0.04s ease-out; }
-        .clip-led { width: 12px; height: 12px; background: #330000; border-radius: 50%; margin-left: 10px; border: 1px solid #550000; transition: background 0.1s ease; }
-        .clip-led.active { background: #ff3333; box-shadow: 0 0 10px #ff3333; border-color: #ff9999; }
+        .vu-container { background: #141414; padding: 15px; border-radius: 8px; border: 1px solid #252525; display: flex; flex-direction: column; gap: 8px; width: 280px; }
+        .vu-row { display: flex; align-items: center; }
+        .vu-label { width: 20px; font-size: 12px; color: #666; font-weight: bold; }
+        .vu-track { flex-grow: 1; height: 10px; background: #111; border-radius: 2px; overflow: hidden; }
+        .vu-bar { height: 100%; width: 0%; background: linear-gradient(to right, #00ffcc 0%, #00ffcc 75%, #ffcc00 88%, #ff3333 100%); transition: width 0.04s ease-out; }
     </style>
 </head>
 <body>
 
-    <h1>🚀 Hybrid-Synth & Faltungshall via WebGPU</h1>
-    <p>Berechnet komplett autonom auf deiner Grafikkarte mittels CubeCL / WebAssembly.</p>
-
-    <!-- GRAPHISCHES STEREO VU-METER -->
-    <div class="vu-container">
-        <div class="vu-row">
-            <span class="vu-label">L</span>
-            <div class="vu-track"><div id="vu-bar-l" class="vu-bar"></div></div>
-            <div id="clip-led-l" class="clip-led"></div>
+    <div style="display: flex; justify-content: space-between; align-items: center; background: #141414; padding: 20px; border-radius: 8px; border: 1px solid #252525; margin-bottom: 20px;">
+        <div>
+            <h1>🎛️ CubeCL WebGPU Super-Synth Dashboard</h1>
+            <p style="margin: 5px 0 0 0; color: #666; font-size: 13px;">100% Hardware-Inferenz auf deiner Grafikkarte via WebAssembly & WGSL</p>
         </div>
-        <div class="vu-row">
-            <span class="vu-label">R</span>
-            <div class="vu-track"><div id="vu-bar-r" class="vu-bar"></div></div>
-            <div id="clip-led-r" class="clip-led"></div>
+        <div class="vu-container">
+            <div class="vu-row"><span class="vu-label">L</span><div class="vu-track"><div id="vu-bar-l" class="vu-bar"></div></div></div>
+            <div class="vu-row"><span class="vu-label">R</span><div class="vu-track"><div id="vu-bar-r" class="vu-bar"></div></div></div>
         </div>
     </div>
 
-    <div class="control-group">
-        <button id="start-btn">Audio Engine Starten</button>
-    </div>
+    <button id="start-btn">Audio Engine Starten</button>
 
-    <!-- NEUER LAUTSTÄRKE SLIDER (GAIN) -->
-    <div class="control-group">
-        <label>Hauptlautstärke (Gain): <span id="gain-val">4.0x</span></label>
-        <input type="range" id="gain-slider" min="0" max="15" value="4" step="0.5">
-    </div>
-    
-      <!-- ADSR ATTACK & DECAY -->
-    <div class="control-group">
-        <label>ADSR Attack: <span id="attack-val">0.10s</span></label>
-        <input type="range" id="attack-slider" min="0.0" max="2.0" value="0.1" step="0.05">
-    </div>
+    <div class="dashboard">
+        <!-- SEKTION 1: HAUPTREGELWERK & ADSR -->
+        <div class="panel">
+            <h2>VCA & Master-Mix</h2>
+            <div class="control-group">
+                <div class="slider-row"><label>Hauptlautstärke (Gain)</label><span id="gain-val" class="val-display">4.0x</span></div>
+                <input type="range" id="gain-slider" min="0" max="15" value="4" step="0.5">
+            </div>
+            <div class="control-group">
+                <div class="slider-row"><label>Frequenz (Note)</label><span id="freq-val" class="val-display">110 Hz</span></div>
+                <input type="range" id="freq-slider" min="55" max="440" value="110" step="1">
+            </div>
+            <div class="control-group">
+                <div class="slider-row"><label>ADSR Attack</label><span id="attack-val" class="val-display">0.10s</span></div>
+                <input type="range" id="attack-slider" min="0.0" max="2.0" value="0.1" step="0.05">
+            </div>
+            <div class="control-group">
+                <div class="slider-row"><label>ADSR Decay</label><span id="decay-val" class="val-display">0.30s</span></div>
+                <input type="range" id="decay-slider" min="0.0" max="2.0" value="0.3" step="0.05">
+            </div>
+        </div>
 
-    <div class="control-group">
-        <label>ADSR Decay: <span id="decay-val">0.30s</span></label>
-        <input type="range" id="decay-slider" min="0.0" max="2.0" value="0.3" step="0.05">
-    </div>
+        <!-- SEKTION 2: SPECTRAL FM SYNTHESIS -->
+        <div class="panel">
+            <h2>FM-Modulator (Oszillator)</h2>
+            <div class="control-group">
+                <div class="slider-row"><label>FM-Ratio (Verhältnis)</label><span id="fm-ratio-val" class="val-display">2.00x</span></div>
+                <input type="range" id="fm-ratio-slider" min="0.5" max="8.0" value="2.0" step="0.25">
+            </div>
+            <div class="control-group">
+                <div class="slider-row"><label>FM-Modulationsindex</label><span id="fm-index-val" class="val-display">2.5x</span></div>
+                <input type="range" id="fm-index-slider" min="0.0" max="10.0" value="2.5" step="0.1">
+            </div>
+        </div>
 
-    <div class="control-group">
-        <label>Frequenz (Note): <span id="freq-val">110 Hz</span></label>
-        <input type="range" id="freq-slider" min="55" max="440" value="110" step="1">
-    </div>
+        <!-- SEKTION 3: FILTERBANK LAYER -->
+        <div class="panel">
+            <h2>Resonanz-Filterbank</h2>
+            <div class="control-group">
+                <div class="slider-row"><label>Basis-Cutoff (Frequenz)</label><span id="cutoff-val" class="val-display">800 Hz</span></div>
+                <input type="range" id="cutoff-slider" min="200" max="4000" value="800">
+            </div>
+            <div class="control-group">
+                <div class="slider-row"><label>Moog Ladder Resonanz</label><span id="moog-res-val" class="val-display">1.50</span></div>
+                <input type="range" id="moog-res-slider" min="0.0" max="3.5" value="1.5" step="0.05">
+            </div>
+            <div class="control-group">
+                <div class="slider-row"><label>Oberheim SEM Resonanz</label><span id="obe-res-val" class="val-display">0.50</span></div>
+                <input type="range" id="obe-res-slider" min="0.0" max="0.95" value="0.5" step="0.05">
+            </div>
+            <div class="control-group">
+                <label style="margin-bottom: 4px;">Oberheim Filter-Modus</label>
+                <select id="obe-mode-select">
+                    <option value="0" selected>LowPass (Tiefpass)</option>
+                    <option value="1">HighPass (Hochpass)</option>
+                    <option value="2">BandPass (Bandpass)</option>
+                    <option value="3">Notch (Kerbfilter)</option>
+                </select>
+            </div>
+        </div>
 
-    <div class="control-group">
-        <label>Moog-Filter Cutoff: <span id="cutoff-val">800 Hz</span></label>
-        <input type="range" id="cutoff-slider" min="200" max="4000" value="800">
-    </div>
+        <!-- SEKTION 4: LOW FREQUENCY OSCILLATOR -->
+        <div class="panel">
+            <h2>LFO (Filter-Modulation)</h2>
+            <div class="control-group">
+                <div class="slider-row"><label>LFO Geschwindigkeit</label><span id="lfo-freq-val" class="val-display">5.0 Hz</span></div>
+                <input type="range" id="lfo-freq-slider" min="0.1" max="20.0" value="5.0" step="0.1">
+            </div>
+            <div class="control-group">
+                <div class="slider-row"><label>LFO Modulationstiefe</label><span id="lfo-depth-val" class="val-display">300 Hz</span></div>
+                <input type="range" id="lfo-depth-slider" min="0" max="1000" value="300" step="10">
+            </div>
+        </div>
 
-    <div class="control-group">
-        <label>Hall-Raumgröße: <span id="room-val">2.5s</span></label>
-        <input type="range" id="room-slider" min="0.5" max="5.0" value="2.5" step="0.1">
-    </div>
-
-    <div class="control-group">
-        <label>Hall-Anteil (Wet Mix): <span id="wet-val">40%</span></label>
-        <input type="range" id="wet-slider" min="0" max="100" value="40">
+        <!-- SEKTION 5: VIRTUELLER HALLRAUM -->
+        <div class="panel">
+            <h2>Prozeduraler Stereo-Hall</h2>
+            <div class="control-group">
+                <div class="slider-row"><label>Hall-Raumgröße (Decay)</label><span id="room-val" class="val-display">2.5s</span></div>
+                <input type="range" id="room-slider" min="0.5" max="5.0" value="2.5" step="0.1">
+            </div>
+            <div class="control-group">
+                <div class="slider-row"><label>Höhen-Dämpfung (Damping)</label><span id="damping-val" class="val-display">1.2</span></div>
+                <input type="range" id="damping-slider" min="0.0" max="5.0" value="1.2" step="0.1">
+            </div>
+            <div class="control-group">
+                <div class="slider-row"><label>Stereobreite (Width)</label><span id="width-val" class="val-display">85%</span></div>
+                <input type="range" id="width-slider" min="0" max="100" value="85" step="5">
+            </div>
+            <div class="control-group">
+                <div class="slider-row"><label>Hall-Anteil (Wet Mix)</label><span id="wet-val" class="val-display">40%</span></div>
+                <input type="range" id="wet-slider" min="0" max="100" value="40">
+            </div>
+        </div>
     </div>
 
 <script type="module">
@@ -88,177 +144,130 @@
     let audioContext;
     let nextStartTime = 0;
     let isPlaying = false;
-    
     const lookAheadTimeMs = 25.0;   
     const scheduleAheadTime = 0.1;  
 
-    let clipTimeoutL = null;
-    let clipTimeoutR = null;
-
-   
-
-    let targetFreq = 110.0;
-    let currentFreq = 110.0;
-    let targetCutoff = 800.0;
-    let currentCutoff = 800.0;
-
-    let targetAttack = 0.1;
-    let currentAttack = 0.1;
-    let targetDecay = 0.3;
-    let currentDecay = 0.3;
+    // Glättungsregister für alle 14 Hardware-Parameter
+    let targets = { freq: 110, cut: 800, att: 0.1, dec: 0.3, ratio: 2.0, idx: 2.5, m_res: 1.5, o_res: 0.5, l_frq: 5.0, l_dpt: 300, room: 2.5, damp: 1.2, width: 0.85, wet: 0.4 };
+    let current = { freq: 110, cut: 800, att: 0.1, dec: 0.3, ratio: 2.0, idx: 2.5, m_res: 1.5, o_res: 0.5, l_frq: 5.0, l_dpt: 300, room: 2.5, damp: 1.2, width: 0.85, wet: 0.4 };
 
     async function startEngine() {
         console.log("Initialisiere WebAssembly und echte WebGPU-Hardware...");
         try {
             await init();
-            
             let rawEngine = new WebAudioEngine();
             audioEngine = await rawEngine.init_engine_async();
-            console.log("CubeCL WebAudioEngine geladen. Starte GPU-Warm-Up... ⚙️");
-
-            await audioEngine.render_block_async(0, 0, 0, 0);
-            console.log("GPU Kernel-Kompilierung (WGSL) abgeschlossen! 🚀 Pipeline ist frei.");
+            
+            // JIT-Compiler einbrennen mit allen 15 v0.10.0-Parametern synchron zu Rust
+            await audioEngine.render_block_async(0,0,0,0,0.1,0.3,2.0,2.5,1.5,0.5,0,5.0,300,0.85,1.2);
+            console.log("GPU Kernel-Kompilierung (WGSL) abgeschlossen! 🚀");
 
             audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 44100 });
-            if (audioContext.state === 'suspended') {
-                await audioContext.resume();
-            }
+            if (audioContext.state === 'suspended') await audioContext.resume();
             
             document.getElementById("start-btn").disabled = true;
             document.getElementById("start-btn").innerText = "Engine läuft 🟢";
-// Initialwerte direkt von den Slidern abfragen, um Knackser im Startmoment zu verhindern
-            targetAttack = parseFloat(document.getElementById("attack-slider").value);
-            targetDecay = parseFloat(document.getElementById("decay-slider").value);
-            currentAttack = targetAttack;
-            currentDecay = targetDecay;
-            
-            //
             nextStartTime = audioContext.currentTime + 0.15;
             isPlaying = true;
-
             schedulerLoop();
-        } catch (error) {
-            console.error("Fehler beim Starten der Engine:", error);
+        } catch (error) { 
+            console.error("Fehler beim Starten:", error); 
         }
     }
 
     async function schedulerLoop() {
         if (!isPlaying) return;
-
-        while (nextStartTime < audioContext.currentTime + scheduleAheadTime) {
-            await spawnGpuBlock();
+        while (nextStartTime < audioContext.currentTime + scheduleAheadTime) { 
+            await spawnGpuBlock(); 
         }
-
         setTimeout(schedulerLoop, lookAheadTimeMs);
     }
 
-   async function spawnGpuBlock() {
-        targetFreq = parseFloat(document.getElementById("freq-slider").value);
-        targetCutoff = parseFloat(document.getElementById("cutoff-slider").value);
-        targetAttack = parseFloat(document.getElementById("attack-slider").value);
-        targetDecay = parseFloat(document.getElementById("decay-slider").value);
+    async function spawnGpuBlock() {
+        // UI-Werte laden
+        targets.freq = parseFloat(document.getElementById("freq-slider").value);
+        targets.cut = parseFloat(document.getElementById("cutoff-slider").value);
+        targets.att = parseFloat(document.getElementById("attack-slider").value);
+        targets.dec = parseFloat(document.getElementById("decay-slider").value);
+        targets.ratio = parseFloat(document.getElementById("fm-ratio-slider").value);
+        targets.idx = parseFloat(document.getElementById("fm-index-slider").value);
+        targets.m_res = parseFloat(document.getElementById("moog-res-slider").value);
+        targets.o_res = parseFloat(document.getElementById("obe-res-slider").value);
+        targets.l_frq = parseFloat(document.getElementById("lfo-freq-slider").value);
+        targets.l_dpt = parseFloat(document.getElementById("lfo-depth-slider").value);
+        targets.room = parseFloat(document.getElementById("room-slider").value);
+        targets.damp = parseFloat(document.getElementById("damping-slider").value);
+        targets.width = parseFloat(document.getElementById("width-slider").value) / 100.0;
+        targets.wet = parseFloat(document.getElementById("wet-slider").value) / 100.0;
         
-        const room = parseFloat(document.getElementById("room-slider").value);
-        const wet = parseFloat(document.getElementById("wet-slider").value) / 100.0;
+        const obeMode = parseInt(document.getElementById("obe-mode-select").value);
         const volumeGain = parseFloat(document.getElementById("gain-slider").value);
 
-        // KORREKTUR: Sanftere Dämpfungsrate (0.15 statt 0.3) für die Zeit-Parameter!
-        // Das verhindert harte Amplitudensprünge (Knackser) an den Blockübergängen bei großen Werten.
-        currentFreq = currentFreq + 0.3 * (targetFreq - currentFreq);
-        currentCutoff = currentCutoff + 0.3 * (targetCutoff - currentCutoff);
-        currentAttack = currentAttack + 0.15 * (targetAttack - currentAttack);
-        currentDecay = currentDecay + 0.15 * (targetDecay - currentDecay);
+        // Sanfter Gleitschutz (0.25er Faktor) über alle Modulationsziele
+        for (let key in targets) { current[key] += 0.25 * (targets[key] - current[key]); }
 
         try {
-            const audioData = await audioEngine.render_block_async(currentFreq, currentCutoff, room, wet, currentAttack, currentDecay);
+            // Abschuss aller 15 Parameter exakt passend zur Signatur in deiner src/lib.rs
+            const audioData = await audioEngine.render_block_async(
+                current.freq, current.cut, current.room, current.wet, current.att, current.dec,
+                current.ratio, current.idx, current.m_res, current.o_res, obeMode,
+                current.l_frq, current.l_dpt, current.width, current.damp
+            );
 
             const bufferSize = audioData.length / 2;
             const audioBuffer = audioContext.createBuffer(2, bufferSize, 44100);
-            
             const leftChannel = audioBuffer.getChannelData(0);
             const rightChannel = audioBuffer.getChannelData(1);
-
-            let maxPeakL = 0.0;
-            let maxPeakR = 0.0;
+            let maxPeakL = 0.0, maxPeakR = 0.0;
 
             for (let i = 0; i < bufferSize; i++) {
                 const lSample = audioData[i * 2] * volumeGain;
                 const rSample = audioData[i * 2 + 1] * volumeGain;
-                
-                leftChannel[i] = lSample;
+                leftChannel[i] = lSample; 
                 rightChannel[i] = rSample;
-
-                const absL = Math.abs(lSample);
-                const absR = Math.abs(rSample);
-                
-                if (absL > maxPeakL) maxPeakL = absL;
+                const absL = Math.abs(lSample), absR = Math.abs(rSample);
+                if (absL > maxPeakL) maxPeakL = absL; 
                 if (absR > maxPeakR) maxPeakR = absR;
             }
 
             updateVuMeter(maxPeakL, maxPeakR);
-
             const bufferSource = audioContext.createBufferSource();
             bufferSource.buffer = audioBuffer;
             bufferSource.connect(audioContext.destination);
-            
             bufferSource.start(nextStartTime);
+            nextStartTime += bufferSize / 44100;
 
-            const bufferDuration = bufferSize / 44100;
-            nextStartTime += bufferDuration;
-
-        } catch (gpuError) {
-            console.error("WebGPU Pipeline Stau:", gpuError);
+        } catch (gpuError) { 
+            console.error("WebGPU Pipeline Stau:", gpuError); 
         }
     }
-      // --- HOCHPRÄZISE LOGARITHMISCHE PEGELANZEIGE (dBFS) ---
+
+    // --- FIX: Strings über echte Backticks (Template Literals) abgesichert ---
     function updateVuMeter(peakL, peakR) {
-        // Schutz vor Logarithmus von 0 (Stille)
-        const safeL = Math.max(1e-5, peakL);
-        const safeR = Math.max(1e-5, peakR);
-
-        // Umrechnung der linearen Amplitude in Dezibel Full Scale (0 dB = Maximum)
-        const dbL = 20 * Math.log10(safeL);
-        const dbR = 20 * Math.log10(safeR);
-
-        // Wir bilden ein Dynamik-Fenster von -45 dB (leer) bis 0 dB (voll) ab
-        const minDb = -45;
+        const dbL = 20 * Math.log10(Math.max(1e-5, peakL));
+        const dbR = 20 * Math.log10(Math.max(1e-5, peakR));
+        let pL = ((dbL - (-45)) / 45) * 100;
+        let pR = ((dbR - (-45)) / 45) * 100;
         
-        // Prozentuale Breite für die CSS-Balken berechnen
-        let percentL = ((dbL - minDb) / (-minDb)) * 100;
-        let percentR = ((dbR - minDb) / (-minDb)) * 100;
-
-        // Werte begrenzen (0% bis 100%)
-        percentL = Math.max(0, Math.min(100, percentL));
-        percentR = Math.max(0, Math.min(100, percentR));
-
-        // Grafische Balken im DOM aktualisieren
-        document.getElementById("vu-bar-l").style.width = `${percentL}%`;
-        document.getElementById("vu-bar-r").style.width = `${percentR}%`;
-
-        // Digitales Clipping triggern, sobald die Hardware-Grenze von 1.0 (0 dBFS) gesprengt wird
-        if (peakL >= 1.0) {
-            const ledL = document.getElementById("clip-led-l");
-            ledL.classList.add("active");
-            clearTimeout(clipTimeoutL);
-            clipTimeoutL = setTimeout(() => ledL.classList.remove("active"), 500);
-        }
-
-        if (peakR >= 1.0) {
-            const ledR = document.getElementById("clip-led-r");
-            ledR.classList.add("active");
-            clearTimeout(clipTimeoutR);
-            clipTimeoutR = setTimeout(() => ledR.classList.remove("active"), 500);
-        }
+        document.getElementById("vu-bar-l").style.width = `${Math.max(0, Math.min(100, pL))}%`;
+        document.getElementById("vu-bar-r").style.width = `${Math.max(0, Math.min(100, pR))}%`;
     }
 
+    // Binder-Routinen für das Dashboard-Feedback
     document.getElementById("start-btn").addEventListener("click", startEngine);
     document.getElementById("gain-slider").addEventListener("input", (e) => document.getElementById("gain-val").innerText = e.target.value + "x");
-    document.getElementById("attack-slider").addEventListener("input", (e) => document.getElementById("attack-val").innerText = parseFloat(e.target.value).toFixed(2) + "s");document.getElementById("decay-slider").addEventListener("input", (e) => document.getElementById("decay-val").innerText = parseFloat(e.target.value).toFixed(2) + "s");
+    document.getElementById("attack-slider").addEventListener("input", (e) => document.getElementById("attack-val").innerText = parseFloat(e.target.value).toFixed(2) + "s");
+    document.getElementById("decay-slider").addEventListener("input", (e) => document.getElementById("decay-val").innerText = parseFloat(e.target.value).toFixed(2) + "s");
+    document.getElementById("fm-ratio-slider").addEventListener("input", (e) => document.getElementById("fm-ratio-val").innerText = parseFloat(e.target.value).toFixed(2) + "x");
+    document.getElementById("fm-index-slider").addEventListener("input", (e) => document.getElementById("fm-index-val").innerText = parseFloat(e.target.value).toFixed(1) + "x");
+    document.getElementById("moog-res-slider").addEventListener("input", (e) => document.getElementById("moog-res-val").innerText = parseFloat(e.target.value).toFixed(2));
+    document.getElementById("obe-res-slider").addEventListener("input", (e) => document.getElementById("obe-res-val").innerText = parseFloat(e.target.value).toFixed(2));
+    document.getElementById("lfo-freq-slider").addEventListener("input", (e) => document.getElementById("lfo-freq-val").innerText = parseFloat(e.target.value).toFixed(1) + " Hz");
+    document.getElementById("lfo-depth-slider").addEventListener("input", (e) => document.getElementById("lfo-depth-val").innerText = e.target.value + " Hz");
     document.getElementById("freq-slider").addEventListener("input", (e) => document.getElementById("freq-val").innerText = e.target.value + " Hz");
     document.getElementById("cutoff-slider").addEventListener("input", (e) => document.getElementById("cutoff-val").innerText = e.target.value + " Hz");
     document.getElementById("room-slider").addEventListener("input", (e) => document.getElementById("room-val").innerText = e.target.value + "s");
+    document.getElementById("damping-slider").addEventListener("input", (e) => document.getElementById("damping-val").innerText = e.target.value);
+    document.getElementById("width-slider").addEventListener("input", (e) => document.getElementById("width-val").innerText = e.target.value + "%");
     document.getElementById("wet-slider").addEventListener("input", (e) => document.getElementById("wet-val").innerText = e.target.value + "%");
 </script>
-
-</body>
-</html>

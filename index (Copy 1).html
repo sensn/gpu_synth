@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <title>CubeCL WebGPU Audio Synthesizer</title>
+    <style>
+        body { font-family: sans-serif; background: #121212; color: #fff; padding: 40px; }
+        .control-group { margin-bottom: 20px; }
+        label { display: inline-block; width: 180px; }
+        button { padding: 10px 20px; font-size: 16px; background: #00ffcc; border: none; cursor: pointer; color: #000; font-weight: bold; }
+        button:disabled { background: #555; color: #aaa; cursor: not-allowed; }
+        
+        /* VU-METER STYLING */
+        .vu-container { background: #1a1a1a; padding: 15px; border-radius: 8px; width: 350px; margin-bottom: 25px; border: 1px solid #333; }
+        .vu-row { display: flex; align-items: center; margin-bottom: 8px; }
+        .vu-row:last-child { margin-bottom: 0; }
+        .vu-label { width: 30px; font-size: 12px; color: #888; font-weight: bold; }
+        .vu-track { flex-grow: 1; height: 12px; background: #222; border-radius: 3px; overflow: hidden; position: relative; }
+        .vu-bar { height: 100%; width: 0%; background: linear-gradient(to right, #00ffcc 70%, #ffcc00 85%, #ff3333 100%); transition: width 0.04s ease-out; }
+        .clip-led { width: 12px; height: 12px; background: #330000; border-radius: 50%; margin-left: 10px; border: 1px solid #550000; transition: background 0.1s ease; }
+        .clip-led.active { background: #ff3333; box-shadow: 0 0 10px #ff3333; border-color: #ff9999; }
+    </style>
+</head>
+<body>
+
+    <h1>🚀 Hybrid-Synth & Faltungshall via WebGPU</h1>
+    <p>Berechnet komplett autonom auf deiner Grafikkarte mittels CubeCL / WebAssembly.</p>
+
+    <!-- GRAPHISCHES STEREO VU-METER -->
+    <div class="vu-container">
+        <div class="vu-row">
+            <span class="vu-label">L</span>
+            <div class="vu-track"><div id="vu-bar-l" class="vu-bar"></div></div>
+            <div id="clip-led-l" class="clip-led"></div>
+        </div>
+        <div class="vu-row">
+            <span class="vu-label">R</span>
+            <div class="vu-track"><div id="vu-bar-r" class="vu-bar"></div></div>
+            <div id="clip-led-r" class="clip-led"></div>
+        </div>
+    </div>
+
+    <div class="control-group">
+        <button id="start-btn">Audio Engine Starten</button>
+    </div>
+
+    <!-- NEUER LAUTSTÄRKE SLIDER (GAIN) -->
+    <div class="control-group">
+        <label>Hauptlautstärke (Gain): <span id="gain-val">4.0x</span></label>
+        <input type="range" id="gain-slider" min="0" max="15" value="4" step="0.5">
+    </div>
+    
+      <!-- ADSR ATTACK & DECAY -->
+    <div class="control-group">
+        <label>ADSR Attack: <span id="attack-val">0.10s</span></label>
+        <input type="range" id="attack-slider" min="0.0" max="2.0" value="0.1" step="0.05">
+    </div>
+
+    <div class="control-group">
+        <label>ADSR Decay: <span id="decay-val">0.30s</span></label>
+        <input type="range" id="decay-slider" min="0.0" max="2.0" value="0.3" step="0.05">
+    </div>
+
+    <div class="control-group">
+        <label>Frequenz (Note): <span id="freq-val">110 Hz</span></label>
+        <input type="range" id="freq-slider" min="55" max="440" value="110" step="1">
+    </div>
+
+    <div class="control-group">
+        <label>Moog-Filter Cutoff: <span id="cutoff-val">800 Hz</span></label>
+        <input type="range" id="cutoff-slider" min="200" max="4000" value="800">
+    </div>
+
+    <div class="control-group">
+        <label>Hall-Raumgröße: <span id="room-val">2.5s</span></label>
+        <input type="range" id="room-slider" min="0.5" max="5.0" value="2.5" step="0.1">
+    </div>
+
+    <div class="control-group">
+        <label>Hall-Anteil (Wet Mix): <span id="wet-val">40%</span></label>
+        <input type="range" id="wet-slider" min="0" max="100" value="40">
+    </div>
+
+<script type="module">
+    import init, { WebAudioEngine } from './pkg/synth.js';
+
+    let audioEngine;
+    let audioContext;
+    let nextStartTime = 0;
+    let isPlaying = false;
+    
+    const lookAheadTimeMs = 25.0;   
+    const scheduleAheadTime = 0.1;  
+
+    let clipTimeoutL = null;
+    let clipTimeoutR = null;
+
+   
+
+    let targetFreq = 110.0;
+    let currentFreq = 110.0;
+    let targetCutoff = 800.0;
+    let currentCutoff = 800.0;
+
+    let targetAttack = 0.1;
+    let currentAttack = 0.1;
+    let targetDecay = 0.3;
+    let currentDecay = 0.3;
+
+    async function startEngine() {
+        console.log("Initialisiere WebAssembly und echte WebGPU-Hardware...");
+        try {
+            await init();
+            
+            let rawEngine = new WebAudioEngine();
+            audioEngine = await rawEngine.init_engine_async();
+            console.log("CubeCL WebAudioEngine geladen. Starte GPU-Warm-Up... ⚙️");
+
+            await audioEngine.render_block_async(0, 0, 0, 0);
+            console.log("GPU Kernel-Kompilierung (WGSL) abgeschlossen! 🚀 Pipeline ist frei.");
+
+            audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 44100 });
+            if (audioContext.state === 'suspended') {
+                await audioContext.resume();
+            }
+            
+            document.getElementById("start-btn").disabled = true;
+            document.getElementById("start-btn").innerText = "Engine läuft 🟢";
+// Initialwerte direkt von den Slidern abfragen, um Knackser im Startmoment zu verhindern
+            targetAttack = parseFloat(document.getElementById("attack-slider").value);
+            targetDecay = parseFloat(document.getElementById("decay-slider").value);
+            currentAttack = targetAttack;
+            currentDecay = targetDecay;
+            
+            //
+            nextStartTime = audioContext.currentTime + 0.15;
+            isPlaying = true;
+
+            schedulerLoop();
+        } catch (error) {
+            console.error("Fehler beim Starten der Engine:", error);
+        }
+    }
+
+    async function schedulerLoop() {
+        if (!isPlaying) return;
+
+        while (nextStartTime < audioContext.currentTime + scheduleAheadTime) {
+            await spawnGpuBlock();
+        }
+
+        setTimeout(schedulerLoop, lookAheadTimeMs);
+    }
+
+   async function spawnGpuBlock() {
+        targetFreq = parseFloat(document.getElementById("freq-slider").value);
+        targetCutoff = parseFloat(document.getElementById("cutoff-slider").value);
+        targetAttack = parseFloat(document.getElementById("attack-slider").value);
+        targetDecay = parseFloat(document.getElementById("decay-slider").value);
+        
+        const room = parseFloat(document.getElementById("room-slider").value);
+        const wet = parseFloat(document.getElementById("wet-slider").value) / 100.0;
+        const volumeGain = parseFloat(document.getElementById("gain-slider").value);
+
+        // KORREKTUR: Sanftere Dämpfungsrate (0.15 statt 0.3) für die Zeit-Parameter!
+        // Das verhindert harte Amplitudensprünge (Knackser) an den Blockübergängen bei großen Werten.
+        currentFreq = currentFreq + 0.3 * (targetFreq - currentFreq);
+        currentCutoff = currentCutoff + 0.3 * (targetCutoff - currentCutoff);
+        currentAttack = currentAttack + 0.15 * (targetAttack - currentAttack);
+        currentDecay = currentDecay + 0.15 * (targetDecay - currentDecay);
+
+        try {
+            const audioData = await audioEngine.render_block_async(currentFreq, currentCutoff, room, wet, currentAttack, currentDecay);
+
+            const bufferSize = audioData.length / 2;
+            const audioBuffer = audioContext.createBuffer(2, bufferSize, 44100);
+            
+            const leftChannel = audioBuffer.getChannelData(0);
+            const rightChannel = audioBuffer.getChannelData(1);
+
+            let maxPeakL = 0.0;
+            let maxPeakR = 0.0;
+
+            for (let i = 0; i < bufferSize; i++) {
+                const lSample = audioData[i * 2] * volumeGain;
+                const rSample = audioData[i * 2 + 1] * volumeGain;
+                
+                leftChannel[i] = lSample;
+                rightChannel[i] = rSample;
+
+                const absL = Math.abs(lSample);
+                const absR = Math.abs(rSample);
+                
+                if (absL > maxPeakL) maxPeakL = absL;
+                if (absR > maxPeakR) maxPeakR = absR;
+            }
+
+            updateVuMeter(maxPeakL, maxPeakR);
+
+            const bufferSource = audioContext.createBufferSource();
+            bufferSource.buffer = audioBuffer;
+            bufferSource.connect(audioContext.destination);
+            
+            bufferSource.start(nextStartTime);
+
+            const bufferDuration = bufferSize / 44100;
+            nextStartTime += bufferDuration;
+
+        } catch (gpuError) {
+            console.error("WebGPU Pipeline Stau:", gpuError);
+        }
+    }
+      // --- HOCHPRÄZISE LOGARITHMISCHE PEGELANZEIGE (dBFS) ---
+    function updateVuMeter(peakL, peakR) {
+        // Schutz vor Logarithmus von 0 (Stille)
+        const safeL = Math.max(1e-5, peakL);
+        const safeR = Math.max(1e-5, peakR);
+
+        // Umrechnung der linearen Amplitude in Dezibel Full Scale (0 dB = Maximum)
+        const dbL = 20 * Math.log10(safeL);
+        const dbR = 20 * Math.log10(safeR);
+
+        // Wir bilden ein Dynamik-Fenster von -45 dB (leer) bis 0 dB (voll) ab
+        const minDb = -45;
+        
+        // Prozentuale Breite für die CSS-Balken berechnen
+        let percentL = ((dbL - minDb) / (-minDb)) * 100;
+        let percentR = ((dbR - minDb) / (-minDb)) * 100;
+
+        // Werte begrenzen (0% bis 100%)
+        percentL = Math.max(0, Math.min(100, percentL));
+        percentR = Math.max(0, Math.min(100, percentR));
+
+        // Grafische Balken im DOM aktualisieren
+        document.getElementById("vu-bar-l").style.width = `${percentL}%`;
+        document.getElementById("vu-bar-r").style.width = `${percentR}%`;
+
+        // Digitales Clipping triggern, sobald die Hardware-Grenze von 1.0 (0 dBFS) gesprengt wird
+        if (peakL >= 1.0) {
+            const ledL = document.getElementById("clip-led-l");
+            ledL.classList.add("active");
+            clearTimeout(clipTimeoutL);
+            clipTimeoutL = setTimeout(() => ledL.classList.remove("active"), 500);
+        }
+
+        if (peakR >= 1.0) {
+            const ledR = document.getElementById("clip-led-r");
+            ledR.classList.add("active");
+            clearTimeout(clipTimeoutR);
+            clipTimeoutR = setTimeout(() => ledR.classList.remove("active"), 500);
+        }
+    }
+
+    document.getElementById("start-btn").addEventListener("click", startEngine);
+    document.getElementById("gain-slider").addEventListener("input", (e) => document.getElementById("gain-val").innerText = e.target.value + "x");
+    document.getElementById("attack-slider").addEventListener("input", (e) => document.getElementById("attack-val").innerText = parseFloat(e.target.value).toFixed(2) + "s");document.getElementById("decay-slider").addEventListener("input", (e) => document.getElementById("decay-val").innerText = parseFloat(e.target.value).toFixed(2) + "s");
+    document.getElementById("freq-slider").addEventListener("input", (e) => document.getElementById("freq-val").innerText = e.target.value + " Hz");
+    document.getElementById("cutoff-slider").addEventListener("input", (e) => document.getElementById("cutoff-val").innerText = e.target.value + " Hz");
+    document.getElementById("room-slider").addEventListener("input", (e) => document.getElementById("room-val").innerText = e.target.value + "s");
+    document.getElementById("wet-slider").addEventListener("input", (e) => document.getElementById("wet-val").innerText = e.target.value + "%");
+</script>
+
+</body>
+</html>

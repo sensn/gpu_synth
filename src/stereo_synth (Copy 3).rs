@@ -1,7 +1,7 @@
 #![allow(warnings)]
 use cubecl::prelude::*;
 
-// Hilfsfunktion: Moog-Ladder Filter-Emulation (24dB/Okt mit Resonanz-Feedback)
+// KORREKTUR: Trait-Vorgaben exakt an den Hauptkernel angeglichen (CubeElement hinzugefügt)
 #[cube]
 fn apply_moog_ladder<F: Float + CubeElement>(bin_freq: F, cutoff: F, resonance: F) -> F {
     let f = bin_freq / F::max(F::new(1.0), cutoff);
@@ -16,7 +16,7 @@ fn apply_moog_ladder<F: Float + CubeElement>(bin_freq: F, cutoff: F, resonance: 
     magnitude
 }
 
-// Hilfsfunktion: Oberheim SEM 2-Pol Multi-Mode Filter (u32-Gating für WASM)
+// KORREKTUR: Trait-Vorgaben exakt an den Hauptkernel angeglichen
 #[cube]
 fn apply_oberheim_sem<F: Float + CubeElement>(bin_freq: F, cutoff: F, resonance: F, mode_select: u32) -> F {
     let f = bin_freq / F::max(F::new(1.0), cutoff);
@@ -38,34 +38,20 @@ fn apply_oberheim_sem<F: Float + CubeElement>(bin_freq: F, cutoff: F, resonance:
     response
 }
 
-// --- DER VOLLSTÄNDIG INTERAKTIVE SYNTHESIZER-KERNEL ---
+// --- DER HAUPT-KERNEL ---
 #[cube(launch)]
 pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
     output_stereo_audio: &mut Array<F>,
-    // 1. Synthesizer Basis-Register
-    frequency: F, old_frequency: F,
-    dyn_cutoff: F, old_cutoff: F,
+    frequency: F,
+    dyn_cutoff: F,
+    old_frequency: F,
+    old_cutoff: F,
     sample_rate: F,
-    global_block_index: u32,
-    
-    // 2. FM-Modulations Parameter (NEU)
-    fm_ratio: F,
-    fm_index: F,
-    
-    // 3. Filterbank Feineinstellung (NEU)
-    moog_resonance: F,
-    oberheim_resonance: F,
-    oberheim_mode: u32,
-    
-    // 4. LFO-Modulations Parameter (NEU)
-    lfo_frequency: F,
-    lfo_depth: F,
-    
-    // 5. Raumakustik & ADSR
     room_size_seconds: F,
     high_freq_damping: F,
     wet_dry_mix: F,
     stereo_width: F,
+    global_block_index: u32,
     attack_time: F,
     decay_time: F,
     #[comptime] fft_size: u32,
@@ -90,17 +76,14 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
             if adsr_amp < sustain_lvl { adsr_amp = sustain_lvl; }
         }
 
-        // LFO-Modulation mit dynamischer Slider-Geschwindigkeit
         let total_samples = (F::cast_from(global_block_index) * samples_per_block) + F::cast_from(n);
         let current_time = total_samples / sample_rate;
-        let lfo_mod = F::sin(F::new(2.0) * pi * lfo_frequency * current_time);
+        let lfo_mod = F::sin(F::new(2.0) * pi * F::new(5.0) * current_time);
 
-        // Slope Interpolation für Knackfreiheit
         let base_freq = old_frequency + (block_progress * (frequency - old_frequency));
         let base_cutoff = old_cutoff + (block_progress * (dyn_cutoff - old_cutoff));
         
-        // Dynamisch modulierter Cutoff über LFO-depth Slider
-        let mut modulated_cutoff = base_cutoff + (lfo_mod * lfo_depth);
+        let mut modulated_cutoff = base_cutoff + (lfo_mod * F::new(300.0));
         if modulated_cutoff < F::new(50.0) { modulated_cutoff = F::new(50.0); }
 
         let num_bins = fft_size / 2 + 1;
@@ -112,10 +95,10 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
             let mut real_spec = F::new(0.0);
             let mut imag_spec = F::new(0.0);
 
-            // 1. DYNAMISCHE FM-GENERIERUNG IM SPEKTRALBEREICH
             if k > 0 && bin_freq < sample_rate / F::new(2.0) {
                 let carrier_freq = base_freq;
-                let mod_freq = base_freq * fm_ratio;
+                let mod_ratio = F::new(2.00); 
+                let mod_freq = base_freq * mod_ratio;
                 
                 let distance_to_carrier = F::abs(bin_freq - carrier_freq);
                 let harmonic_step = distance_to_carrier / mod_freq;
@@ -123,22 +106,20 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
                 
                 if fract < F::new(0.15) || fract > F::new(0.85) {
                     let order = F::floor(harmonic_step);
-                    // Amplitudenskalierung über den interaktiven fm_index Slider
-                    let sideband_amplitude = fm_index / (F::new(1.0) + order * order);
+                    let sideband_amplitude = F::new(2.5) / (F::new(1.0) + order * order);
                     
                     if k % 2 == 0 { real_spec = sideband_amplitude; } else { imag_spec = sideband_amplitude; }
                 }
             }
 
-            // 2. PARALLELE FILTERBANK FUSION MIT DYNAMISCHEN RECONANCE-SLIDERN
-            let moog_gain: F = apply_moog_ladder::<F>(bin_freq, modulated_cutoff, moog_resonance);
-            let oberheim_gain: F = apply_oberheim_sem::<F>(bin_freq, modulated_cutoff, oberheim_resonance, oberheim_mode); 
+            // KORREKTUR: Eindeutige Typ-Inferenz erzwungen durch den Turbofish-Aufruf ::<F>
+            let moog_gain: F = apply_moog_ladder::<F>(bin_freq, modulated_cutoff, F::new(1.5));
+            let oberheim_gain: F = apply_oberheim_sem::<F>(bin_freq, modulated_cutoff, F::new(0.5), 0); 
 
             let combined_filter_gain = (moog_gain + oberheim_gain) * F::new(0.5);
             let filtered_real = real_spec * combined_filter_gain;
             let filtered_imag = imag_spec * combined_filter_gain;
 
-            // 3. PROZEDURALER HALL (True Stereo Matrix)
             let freq_factor = F::new(1.0) + (bin_freq * high_freq_damping * F::new(0.0001));
             let effective_decay = room_size_seconds / freq_factor;
             let amplitude = F::exp(-k_f / F::max(F::new(1.0), effective_decay * F::new(10.0)));
@@ -168,7 +149,6 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
             let res_r_real = (F::new(1.0) - wet_dry_mix) * filtered_real + wet_dry_mix * wet_r_real;
             let res_r_imag = (F::new(1.0) - wet_dry_mix) * filtered_imag + wet_dry_mix * wet_r_imag;
 
-            // 4. PHASENKORREKTE INVERSE DFT AKKUMULATION
             let angle = (F::new(2.0) * pi * k_f * F::cast_from(n)) / samples_per_block;
             let cos_a = F::cos(angle);
             let sin_a = F::sin(angle);
@@ -178,6 +158,7 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
         }
 
         let scale = F::new(2.0) / samples_per_block;
+        
         let idx_l: usize = (n * 2) as usize;
         let idx_r: usize = (n * 2 + 1) as usize;
         

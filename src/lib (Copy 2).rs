@@ -40,17 +40,23 @@ impl WebAudioEngine {
         })
     }
 
-    // VOLLSTÄNDIGE HARDWARE SIGNATUR: Mappt alle UI-Parameter direkt an die GPU-Register
+    // FIX: Die Signatur nimmt nun attack und decay als f32 entgegen!
     pub fn render_block_async(
         &self, 
-        frequency: f32, cutoff: f32, room_size: f32, wet_mix: f32, attack: f32, decay: f32,
-        fm_ratio: f32, fm_index: f32, moog_res: f32, obe_res: f32, obe_mode: u32,
-        lfo_freq: f32, lfo_depth: f32, stereo_width: f32, high_freq_damping: f32
+        frequency: f32, 
+        cutoff: f32, 
+        room_size: f32, 
+        wet_mix: f32, 
+        attack: f32, 
+        decay: f32
     ) -> js_sys::Promise {
-        let client = self.client.as_ref().expect("Engine nicht initialisiert.").clone();
+        let client = self.client.as_ref()
+            .expect("Engine nicht initialisiert. Rufe zuerst init_engine_async auf.")
+            .clone();
             
         let output_len = (self.fft_size * 2) as usize;
         let initial_data = vec![0.0f32; output_len];
+        
         let byte_vec = bytemuck::cast_slice(&initial_data).to_vec();
         let raw_bytes = cubecl::bytes::Bytes::from_bytes_vec(byte_vec);
         let handle_out = client.create(raw_bytes);
@@ -63,15 +69,24 @@ impl WebAudioEngine {
         let old_cut = self.last_cutoff.get();
         let current_block = self.block_counter.get();
 
+        // Übergabe aller Parameter an den GPU-Kernel
         cubek_true_stereo_synth_reverb::launch::<f32, WgpuRuntime>(
-            &client, grid_dim, cube_dim, array_arg,
-            frequency, old_freq, cutoff, old_cut,
-            44100.0, current_block,
-            fm_ratio, fm_index,
-            moog_res, obe_res, obe_mode,
-            lfo_freq, lfo_depth,
-            room_size, high_freq_damping, wet_mix, stereo_width,
-            attack, decay,
+            &client,
+            grid_dim,
+            cube_dim,
+            array_arg,
+            frequency,
+            cutoff,
+            old_freq,  
+            old_cut,   
+            44100.0,
+            room_size,
+            1.2,
+            wet_mix,
+            0.85,
+            current_block, 
+            attack, // Reicht den Attack-Wert an die GPU weiter
+            decay,  // Reiche den Decay-Wert an die GPU weiter
             self.fft_size,
         );
 
@@ -82,8 +97,12 @@ impl WebAudioEngine {
         future_to_promise(async move {
             let result_bytes_res = client.read_async(vec![handle_out]).await;
             let result_bytes_vec = result_bytes_res.expect("WebGPU asynchroner Lesevorgang fehlgeschlagen");
+            
             if let Some(first_bytes) = result_bytes_vec.first() {
-                let js_array = js_sys::Float32Array::from(bytemuck::cast_slice(first_bytes.as_ref()) as &[f32]);
+                let raw_slice: &[u8] = first_bytes.as_ref();
+                let audio_samples: &[f32] = bytemuck::cast_slice(raw_slice);
+                
+                let js_array = js_sys::Float32Array::from(audio_samples);
                 Ok(JsValue::from(js_array))
             } else {
                 Err(JsValue::from_str("Fehler beim Extrahieren des GPU-Byte-Streams"))
