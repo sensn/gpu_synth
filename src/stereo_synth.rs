@@ -38,7 +38,7 @@ fn apply_oberheim_sem<F: Float + CubeElement>(bin_freq: F, cutoff: F, resonance:
     response
 }
 
-// --- DER HYBRIDE SÄGEZAHN / FM KERNEL ---
+// --- DER ENERGIE-NORMALISIERTE HYBRIDE RECHEN KERNEL ---
 #[cube(launch)]
 pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
     output_stereo_audio: &mut Array<F>,
@@ -101,35 +101,33 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
             let mut imag_spec = F::new(0.0);
 
             if k > 0 && bin_freq < sample_rate / F::new(2.0) {
-                // Modulationsfrequenz berechnen
                 let mod_freq = base_freq * fm_ratio;
 
-                // --- ECHTE HYBRIDE SPEKTRAL-FM MIT SÄGEZAHN-RÜCKGRAT ---
-                // Schleife über die stärksten Harmonischen des Träger-Sägezahns (bis zu 32 Teiltöne)
+                // Loop über die stärksten Harmonischen des Träger-Sägezahns
                 for h in 1..33 {
                     let h_f = F::cast_from(h);
                     let carrier_harmonic_freq = base_freq * h_f;
 
-                    // Wenn die Grundharmonische die Nyquist-Grenze überschreitet, brechen wir ab (Bandlimiting)
                     if carrier_harmonic_freq < sample_rate / F::new(2.0) {
-                        
-                        // Amplitude des unmodulierten Sägezahns (1/h)
                         let saw_base_amp = F::new(1.0) / h_f;
 
-                        // Berechne den Abstand des aktuellen Bins zu DIESER Harmonischen
                         let distance_to_harmonic = F::abs(bin_freq - carrier_harmonic_freq);
+                        
+                        // KORREKTOR: Nutze die deklarierte Variable distance_to_harmonic statt distance_to_carrier
                         let harmonic_step = distance_to_harmonic / mod_freq;
                         let fract = harmonic_step - F::floor(harmonic_step);
 
-                        // Wenn das Bin auf ein FM-Seitenband dieser Sägezahn-Harmonischen fällt
-                        if fract < F::new(0.15) || fract > F::new(0.85) {
+                        if fract < F::new(0.18) || fract > F::new(0.82) {
                             let order = F::floor(harmonic_step);
                             
-                            // Fusion: Sägezahn-Grundamplitude (1/h) skaliert mit der FM-Modulationsdämpfung
-                            let fm_sideband_damping = F::new(1.0) / (F::new(1.0) + order * order * F::max(F::new(0.1), F::new(11.0) - fm_index));
-                            let final_amplitude = saw_base_amp * fm_sideband_damping * F::max(F::new(0.2), fm_index * F::new(0.5));
+                            // Dynamische Flanken-Öffnung basierend auf dem Modulationsindex
+                            let width_factor = F::max(F::new(0.001), fm_index);
+                            let fm_sideband_damping = F::exp(-order / width_factor);
 
-                            // Symmetrische Phasen-Verteilung
+                            // Pegel-Kompensation hält die Gesamtlautstärke stabil
+                            let compensation = F::new(1.0) / F::sqrt(F::new(1.0) + fm_index * F::new(0.5));
+                            let final_amplitude = saw_base_amp * fm_sideband_damping * compensation;
+
                             if k % 2 == 0 {
                                 real_spec += final_amplitude;
                             } else {
@@ -140,7 +138,7 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
                 }
             }
 
-            // 2. PARALLELE FILTERBANK FUSION
+            // Parallel-Filterbank
             let moog_gain: F = apply_moog_ladder::<F>(bin_freq, modulated_cutoff, moog_resonance);
             let oberheim_gain: F = apply_oberheim_sem::<F>(bin_freq, modulated_cutoff, oberheim_resonance, oberheim_mode); 
 
@@ -148,7 +146,7 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
             let filtered_real = real_spec * combined_filter_gain;
             let filtered_imag = imag_spec * combined_filter_gain;
 
-            // 3. PROZEDURALER HALL (True Stereo Matrix)
+            // Prozeduraler Stereo-Hall
             let freq_factor = F::new(1.0) + (bin_freq * high_freq_damping * F::new(0.0001));
             let effective_decay = room_size_seconds / freq_factor;
             let amplitude = F::exp(-k_f / F::max(F::new(1.0), effective_decay * F::new(10.0)));
@@ -178,7 +176,7 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
             let res_r_real = (F::new(1.0) - wet_dry_mix) * filtered_real + wet_dry_mix * wet_r_real;
             let res_r_imag = (F::new(1.0) - wet_dry_mix) * filtered_imag + wet_dry_mix * wet_r_imag;
 
-            // 4. PHASENKORREKTE INVERSE DFT AKKUMULATION
+            // Phasenkorrekte Inverse DFT Akkumulation
             let angle = (F::new(2.0) * pi * k_f * F::cast_from(n)) / samples_per_block;
             let cos_a = F::cos(angle);
             let sin_a = F::sin(angle);
