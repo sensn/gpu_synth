@@ -34,6 +34,19 @@
         .vu-label { width: 20px; font-size: 12px; color: #666; font-weight: bold; }
         .vu-track { flex-grow: 1; height: 10px; background: #111; border-radius: 2px; overflow: hidden; }
         .vu-bar { height: 100%; width: 0%; background: linear-gradient(to right, #00ffcc 0%, #00ffcc 75%, #ffcc00 88%, #ff3333 100%); transition: width 0.04s ease-out; }
+
+        /* PIANO KEYBOARD */
+        .keyboard-container { margin-top: 25px; background: #141414; padding: 20px; border-radius: 8px; border: 1px solid #252525; }
+        .keyboard-container h3 { margin: 0 0 12px 0; font-size: 13px; color: #aaa; text-transform: uppercase; letter-spacing: 1px; }
+        .piano { display: flex; flex-wrap: wrap; gap: 2px; }
+        .key { width: 42px; height: 110px; background: #f4f4f4; border: 1px solid #999; border-radius: 0 0 4px 4px; cursor: pointer; position: relative; }
+        .key:active, .key.active { background: #00ffcc; border-color: #00ffcc; }
+        .key .key-label { position: absolute; bottom: 6px; left: 0; right: 0; text-align: center; font-size: 10px; color: #333; font-weight: bold; }
+        .key .key-note { position: absolute; bottom: 22px; left: 0; right: 0; text-align: center; font-size: 9px; color: #888; }
+        .drone-toggle { margin-top: 15px; display: flex; align-items: center; gap: 10px; }
+        .drone-toggle label { font-size: 12px; color: #aaa; text-transform: uppercase; }
+        .drone-toggle input { accent-color: #00ffcc; width: 18px; height: 18px; cursor: pointer; }
+        .gate-status { font-size: 11px; color: #666; font-family: monospace; margin-left: auto; }
     </style>
 </head>
 <body>
@@ -78,6 +91,14 @@
             <div class="control-group">
                 <div class="slider-row"><label>Master Decay</label><span id="decay-val" class="val-display">0.30s</span></div>
                 <input type="range" id="decay-slider" min="0.0" max="2.0" value="0.3" step="0.05">
+            </div>
+            <div class="control-group">
+                <div class="slider-row"><label>Master Sustain</label><span id="sustain-val" class="val-display">70%</span></div>
+                <input type="range" id="sustain-slider" min="0" max="100" value="70" step="1">
+            </div>
+            <div class="control-group">
+                <div class="slider-row"><label>Master Release</label><span id="release-val" class="val-display">0.40s</span></div>
+                <input type="range" id="release-slider" min="0.0" max="4.0" value="0.4" step="0.05">
             </div>
             <div class="control-group">
                 <label style="margin-bottom: 4px;">DX7 Algorithmus-Struktur</label>
@@ -164,9 +185,20 @@
                 <div class="slider-row"><label>Hall Wet Mix</label><span id="wet-val" class="val-display">40%</span></div>
                 <input type="range" id="wet-slider" min="0" max="100" value="40">
             </div>
+    </div>
+
+    <!-- PIANO KEYBOARD FÜR NOTE-EVENTS -->
+    <div class="keyboard-container">
+        <h3>🎹 Keyboard — Note Events (Computer-Tastatur: A W S E D F T G Z H U J K)</h3>
+        <div class="piano" id="piano-container"></div>
+        <div class="drone-toggle">
+            <input type="checkbox" id="drone-mode" checked>
+            <label for="drone-mode">Drone-Modus (Gate dauerhaft offen — alter Verhalten)</label>
+            <span class="gate-status" id="gate-status">Gate: OFF</span>
         </div>
     </div>
-<script type="module">
+
+    <script type="module">
     import init, { WebAudioEngine } from './pkg/synth.js';
 
     let audioEngine;
@@ -177,8 +209,8 @@
     const scheduleAheadTime = 0.1;
 
     // Glättungssystem für Basisparameter
-    let targets = { freq: 110, cut: 800, att: 0.1, dec: 0.3, room: 2.5, wet: 0.4, m_res: 1.5, o_res: 0.5, l_frq: 5.0, l_dpt: 300, width: 0.85, damp: 1.2 };
-    let current = { freq: 110, cut: 800, att: 0.1, dec: 0.3, room: 2.5, wet: 0.4, m_res: 1.5, o_res: 0.5, l_frq: 5.0, l_dpt: 300, width: 0.85, damp: 1.2 };
+    let targets = { freq: 110, cut: 800, att: 0.1, dec: 0.3, sus: 0.7, rel: 0.4, room: 2.5, wet: 0.4, m_res: 1.5, o_res: 0.5, l_frq: 5.0, l_dpt: 300, width: 0.85, damp: 1.2 };
+    let current = { freq: 110, cut: 800, att: 0.1, dec: 0.3, sus: 0.7, rel: 0.4, room: 2.5, wet: 0.4, m_res: 1.5, o_res: 0.5, l_frq: 5.0, l_dpt: 300, width: 0.85, damp: 1.2 };
 
     // Vektorisierte Glättungsregister für alle 6 OPs
     let targetRatios = new Float32Array([1.0, 1.0, 3.5, 2.0, 7.0, 0.5]);
@@ -205,9 +237,9 @@
             audioEngine = await rawEngine.init_engine_async();
             console.log("CubeCL WebAudioEngine geladen. Starte GPU-Warm-Up... ⚙️");
             
-            // Warm-Up Parameteraufruf exakt an die 16 Parameter der lib.rs angepasst
+            // Warm-Up Parameteraufruf exakt an die 18 Parameter der lib.rs angepasst
             await audioEngine.render_block_async(
-                110.0, 800.0, 2.5, 0.4, 0.1, 0.3, 
+                110.0, 800.0, 2.5, 0.4, 0.1, 0.3, 0.7, 0.4,
                 currentRatios, currentLevels, 0, 1.5, 0.5, 0,
                 5.0, 300.0, 0.85, 1.2
             );
@@ -215,6 +247,12 @@
             
             audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 44100 });
             if (audioContext.state === 'suspended') await audioContext.resume();
+            
+            // Drone-Modus: Gate sofort öffnen, damit der Sound wie vorher sofort startet
+            if (document.getElementById("drone-mode").checked) {
+                audioEngine.note_on(110.0);
+                updateGateStatus();
+            }
             
             document.getElementById("start-btn").disabled = true;
             document.getElementById("start-btn").innerText = "Engine läuft 🟢";
@@ -235,6 +273,8 @@
         targets.cut = parseFloat(document.getElementById("cutoff-slider").value);
         targets.att = parseFloat(document.getElementById("attack-slider").value);
         targets.dec = parseFloat(document.getElementById("decay-slider").value);
+        targets.sus = parseFloat(document.getElementById("sustain-slider").value) / 100.0;
+        targets.rel = parseFloat(document.getElementById("release-slider").value);
         targets.room = parseFloat(document.getElementById("room-slider").value);
         targets.wet = parseFloat(document.getElementById("wet-slider").value) / 100.0;
         targets.m_res = parseFloat(document.getElementById("moog-res-slider").value);
@@ -265,6 +305,7 @@
         try {
             const audioData = await audioEngine.render_block_async(
                 current.freq, current.cut, current.room, current.wet, current.att, current.dec,
+                current.sus, current.rel,
                 sendRatios, sendLevels, algo, current.m_res, current.o_res, obeMode,
                 current.l_frq, current.l_dpt, current.width, current.damp
             );
@@ -319,6 +360,100 @@
         document.getElementById(`op${i}-ratio-slider`).addEventListener("input", (e) => document.getElementById(`op${i}-ratio-val`).innerText = parseFloat(e.target.value).toFixed(2) + "x");
         document.getElementById(`op${i}-level-slider`).addEventListener("input", (e) => document.getElementById(`op${i}-level-val`).innerText = parseFloat(e.target.value).toFixed(2));
     }
+
+    // ============================================================
+    // NOTE-EVENT-SYSTEM: Piano-Keyboard + Computer-Tastatur
+    // ============================================================
+
+    // Computer-Tastatur-Mapping (DX7-artig): A=C, W=C#, S=D, E=D#, D=E, F=F, T=F#, G=G, Z=G#, H=A, U=A#, J=B, K=C+1
+    const KEY_TO_SEMITONE = {
+        'a': 0, 'w': 1, 's': 2, 'e': 3, 'd': 4, 'f': 5, 't': 6,
+        'g': 7, 'z': 8, 'h': 9, 'u': 10, 'j': 11, 'k': 12, 'o': 13, 'l': 14
+    };
+    const KEY_LABELS = { 0:'A', 1:'W', 2:'S', 3:'E', 4:'D', 5:'F', 6:'T', 7:'G', 8:'Z', 9:'H', 10:'U', 11:'J', 12:'K', 13:'O', 14:'L' };
+
+    // Basis-Oktave: A2 = 110 Hz (Semiton 0). 15 Tasten = 2 Oktaven.
+    const BASE_FREQ = 110.0;
+    const NUM_SEMITONES = 15;
+    const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+
+    function semitoneToFreq(semi) { return BASE_FREQ * Math.pow(2, semi / 12); }
+
+    // On-Screen Piano generieren (nur weiße Tasten-Optik, alle 15 Semitöne klickbar)
+    const pianoContainer = document.getElementById("piano-container");
+    for (let semi = 0; semi < NUM_SEMITONES; semi++) {
+        const key = document.createElement("div");
+        key.className = "key";
+        key.dataset.semitone = semi;
+        const noteName = NOTE_NAMES[(semi + 9) % 12]; // A2-Basis: Semi 0 = A
+        const octave = Math.floor((semi + 9) / 12) + 2;
+        key.innerHTML = `<span class="key-note">${noteName}${octave}</span><span class="key-label">${KEY_LABELS[semi] || ''}</span>`;
+        key.addEventListener("mousedown", () => triggerNoteOn(semi, key));
+        key.addEventListener("mouseup", () => triggerNoteOff(key));
+        key.addEventListener("mouseleave", () => triggerNoteOff(key));
+        pianoContainer.appendChild(key);
+    }
+
+    function updateGateStatus() {
+        const el = document.getElementById("gate-status");
+        if (el && audioEngine) el.innerText = "Gate: " + (audioEngine.is_gate_on() ? "ON" : "OFF");
+    }
+
+    function triggerNoteOn(semi, keyElement) {
+        if (!audioEngine) return;
+        const freq = semitoneToFreq(semi);
+        // Frequenz-Slider synchronisieren, damit die Glättung folgt
+        document.getElementById("freq-slider").value = freq.toFixed(0);
+        document.getElementById("freq-val").innerText = freq.toFixed(0) + " Hz";
+        audioEngine.note_on(freq);
+        if (keyElement) keyElement.classList.add("active");
+        updateGateStatus();
+    }
+
+    function triggerNoteOff(keyElement) {
+        if (!audioEngine) return;
+        if (document.getElementById("drone-mode").checked) return; // Drone: Gate bleibt offen
+        audioEngine.note_off();
+        if (keyElement) keyElement.classList.remove("active");
+        updateGateStatus();
+    }
+
+    // Computer-Tastatur (keydown/keyup mit Repeat-Unterdrückung)
+    const heldKeys = new Set();
+    window.addEventListener("keydown", (e) => {
+        if (e.repeat) return;
+        const semi = KEY_TO_SEMITONE[e.key.toLowerCase()];
+        if (semi === undefined) return;
+        if (heldKeys.has(e.key.toLowerCase())) return;
+        heldKeys.add(e.key.toLowerCase());
+        const keyEl = document.querySelector(`.key[data-semitone="${semi}"]`);
+        triggerNoteOn(semi, keyEl);
+    });
+    window.addEventListener("keyup", (e) => {
+        const k = e.key.toLowerCase();
+        if (!heldKeys.has(k)) return;
+        heldKeys.delete(k);
+        const semi = KEY_TO_SEMITONE[k];
+        const keyEl = document.querySelector(`.key[data-semitone="${semi}"]`);
+        triggerNoteOff(keyEl);
+    });
+
+    // Drone-Modus Toggle
+    document.getElementById("drone-mode").addEventListener("change", (e) => {
+        if (!audioEngine) return;
+        if (e.target.checked) {
+            const f = parseFloat(document.getElementById("freq-slider").value);
+            targets.freq = f; current.freq = f;
+            audioEngine.note_on(f);
+        } else {
+            audioEngine.note_off();
+        }
+        updateGateStatus();
+    });
+
+    // Sustain/Release Slider-Displays
+    document.getElementById("sustain-slider").addEventListener("input", (e) => document.getElementById("sustain-val").innerText = e.target.value + "%");
+    document.getElementById("release-slider").addEventListener("input", (e) => document.getElementById("release-val").innerText = parseFloat(e.target.value).toFixed(2) + "s");
 </script>
 </body>
 </html>

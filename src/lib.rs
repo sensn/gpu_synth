@@ -16,6 +16,10 @@ pub struct WebAudioEngine {
     last_cutoff: Cell<f32>,
     lfo_phase: Cell<f32>,
     block_count: Cell<u32>,
+    // Note-Event-Zustand für die absolute-time ADSR (Sample-Zeitachse)
+    gate_on: Cell<bool>,
+    note_on_sample: Cell<u32>,
+    note_off_sample: Cell<u32>,
 }
 
 #[wasm_bindgen]
@@ -29,7 +33,33 @@ impl WebAudioEngine {
             last_cutoff: Cell::new(800.0),
             lfo_phase: Cell::new(0.0),
             block_count: Cell::new(0),
+            gate_on: Cell::new(false),
+            note_on_sample: Cell::new(0),
+            note_off_sample: Cell::new(0),
         }
+    }
+
+    /// Note-On: öffnet das Gate und startet die ADSR-Hüllkurve ab dem nächsten Block.
+    /// `frequency` ist die neue Grundfrequenz in Hz.
+    pub fn note_on(&self, frequency: f32) {
+        // Note-On-Zeitpunkt: Start des nächsten Blocks (der aktuelle Block ist
+        // bereits mit altem Zustand unterwegs).
+        let next_block_start = self.block_count.get().wrapping_mul(self.fft_size);
+        self.note_on_sample.set(next_block_start);
+        self.gate_on.set(true);
+        self.last_frequency.set(frequency);
+    }
+
+    /// Note-Off: schließt das Gate; die Release-Phase startet ab dem nächsten Block.
+    pub fn note_off(&self) {
+        let next_block_start = self.block_count.get().wrapping_mul(self.fft_size);
+        self.note_off_sample.set(next_block_start);
+        self.gate_on.set(false);
+    }
+
+    /// Gate-Status abfragen (nützlich für UI-Feedback).
+    pub fn is_gate_on(&self) -> bool {
+        self.gate_on.get()
     }
 
     pub fn init_engine_async(mut self) -> js_sys::Promise {
@@ -45,6 +75,7 @@ impl WebAudioEngine {
     pub fn render_block_async(
         &self, 
         frequency: f32, cutoff: f32, room_size: f32, wet_mix: f32, attack: f32, decay: f32,
+        sustain: f32, release: f32,
         js_ratios: js_sys::Float32Array,
         js_levels: js_sys::Float32Array,
         algo_select: u32,
@@ -79,7 +110,7 @@ impl WebAudioEngine {
         let current_lfo_phase = self.lfo_phase.get();
         let current_block_index = self.block_count.get();
 
-        // FIX: Reicht jetzt lückenlos alle 26 Argumente in der korrekten Reihenfolge an die GPU weiter!
+        // FIX: Reicht jetzt lückenlos alle Argumente in der korrekten Reihenfolge an die GPU weiter!
         cubek_true_stereo_synth_reverb::launch::<f32, WgpuRuntime>(
             &client, grid_dim, cube_dim, arg_audio,
             frequency, old_freq, 
@@ -89,9 +120,12 @@ impl WebAudioEngine {
             moog_res, obe_res, obe_mode,
             lfo_freq, lfo_depth,
             room_size, high_freq_damping, wet_mix, stereo_width, 
-            attack, decay,
-            current_block_index, // Mappt exakt auf Position 21 (u32 Runtime-Parameter)
-            self.fft_size,       // Mappt exakt auf Position 22 (#[comptime] fft_size)
+            attack, decay, sustain, release,
+            if self.gate_on.get() { 1u32 } else { 0u32 },
+            self.note_on_sample.get(),
+            self.note_off_sample.get(),
+            current_block_index, // Globaler Block-Zähler für die absolute IDFT-Phase
+            self.fft_size,       // #[comptime] fft_size
         );
 
         let block_duration = (self.fft_size as f32) / 44100.0;

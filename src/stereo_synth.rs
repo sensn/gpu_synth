@@ -53,6 +53,13 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
     stereo_width: F,
     attack_time: F,
     decay_time: F,
+    sustain_level: F,
+    release_time: F,
+    // Note-Event-Zustand (vom Host verwaltet, absolute Sample-Zeitachse)
+    // gate_is_on: 1 = Gate offen (A/D/S), 0 = Gate zu (Release)
+    gate_is_on: u32,
+    note_on_sample: u32,
+    note_off_sample: u32,
     // NEU: Globaler Block-Zähler für nahtlose IDFT-Phase
     global_block_index: u32,
     #[comptime] fft_size: u32,
@@ -64,21 +71,58 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
         let mut final_sample_r = F::new(0.0);
         let pi = F::new(std::f32::consts::PI);
         let samples_per_block = F::cast_from(fft_size);
-        
-        let block_progress = F::cast_from(n) / samples_per_block;
-        let sustain_lvl = F::new(0.6);
-        let mut master_amp = F::new(1.0);
 
-        if attack_time > F::new(0.05) {
-            master_amp = block_progress / attack_time;
-            if master_amp > F::new(1.0) { master_amp = F::new(1.0); }
-        } 
-        if decay_time > F::new(0.05) {
-            let decay_factor = block_progress * decay_time * (F::new(1.0) - sustain_lvl);
-            let mut current_decay_amp = F::new(1.0) - decay_factor;
-            if current_decay_amp < sustain_lvl { current_decay_amp = sustain_lvl; }
-            if current_decay_amp < master_amp { master_amp = current_decay_amp; }
+        // --- ABSOLUTE-TIME ADSR: Hüllkurve auf der globalen Sample-Zeitachse ---
+        // Alle Zeiten in Sekunden, blockübergreifend kontinuierlich (kein Block-Eiern mehr).
+        let global_sample = F::cast_from(global_block_index) * samples_per_block + F::cast_from(n);
+        let t_on = F::cast_from(note_on_sample);
+        let t_off = F::cast_from(note_off_sample);
+
+        // Zeit seit Note-On in Sekunden (immer >= 0)
+        let mut t_since_on = (global_sample - t_on) / sample_rate;
+        if t_since_on < F::new(0.0) { t_since_on = F::new(0.0); }
+        // Zeit seit Note-Off in Sekunden (nur relevant wenn Gate zu)
+        let mut t_since_off = (global_sample - t_off) / sample_rate;
+        if t_since_off < F::new(0.0) { t_since_off = F::new(0.0); }
+
+        let mut master_amp = F::new(0.0);
+
+        if gate_is_on == 1 {
+            // --- ATTACK: linearer Anstieg von 0 auf 1 ---
+            if t_since_on < attack_time {
+                master_amp = t_since_on / F::max(F::new(0.001), attack_time);
+            } else if t_since_on < attack_time + decay_time {
+                // --- DECAY: exponentieller Abfall von 1 auf Sustain ---
+                let t_decay = t_since_on - attack_time;
+                let d = F::max(F::new(0.001), decay_time);
+                master_amp = sustain_level + (F::new(1.0) - sustain_level) * F::exp(-t_decay / d);
+            } else {
+                // --- SUSTAIN ---
+                master_amp = sustain_level;
+            }
+        } else {
+            // --- RELEASE: exponentieller Abfall vom Pegel bei Note-Off ---
+            // Rekonstruiert den Pegel, den die Hüllkurve zum Note-Off-Zeitpunkt hatte,
+            // damit der Release nahtlos anschließt (kein Sprung).
+            let amp_at_off = if t_off > t_on {
+                let t_at_off = (t_off - t_on) / sample_rate;
+                if t_at_off < attack_time {
+                    t_at_off / F::max(F::new(0.001), attack_time)
+                } else if t_at_off < attack_time + decay_time {
+                    let t_decay = t_at_off - attack_time;
+                    let d = F::max(F::new(0.001), decay_time);
+                    sustain_level + (F::new(1.0) - sustain_level) * F::exp(-t_decay / d)
+                } else {
+                    sustain_level
+                }
+            } else {
+                F::new(0.0)
+            };
+            let r = F::max(F::new(0.001), release_time);
+            master_amp = amp_at_off * F::exp(-t_since_off / r);
         }
+
+        let block_progress = F::cast_from(n) / samples_per_block;
 
         let sample_phase_delta = (F::new(2.0) * pi * lfo_frequency * block_progress * samples_per_block) / sample_rate;
         let lfo_mod = F::sin(lfo_accumulated_phase + sample_phase_delta);
