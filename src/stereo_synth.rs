@@ -16,7 +16,12 @@ fn apply_moog_ladder<F: Float + CubeElement>(bin_freq: F, cutoff: F, resonance: 
 }
 
 #[cube]
-fn apply_oberheim_sem<F: Float + CubeElement>(bin_freq: F, cutoff: F, resonance: F, mode_select: u32) -> F {
+fn apply_oberheim_sem<F: Float + CubeElement>(
+    bin_freq: F,
+    cutoff: F,
+    resonance: F,
+    mode_select: u32,
+) -> F {
     let f = bin_freq / F::max(F::new(1.0), cutoff);
     let f2 = f * f;
     let damping = F::new(1.0) / F::max(F::new(0.1), F::new(1.0) - resonance);
@@ -24,10 +29,15 @@ fn apply_oberheim_sem<F: Float + CubeElement>(bin_freq: F, cutoff: F, resonance:
     let sqrt_denom = F::sqrt(denominator);
 
     let mut response = F::new(0.0);
-    if mode_select == 0 { response = F::new(1.0) / sqrt_denom; }
-    else if mode_select == 1 { response = f2 / sqrt_denom; }
-    else if mode_select == 2 { response = f / sqrt_denom; }
-    else { response = F::abs(F::new(1.0) - f2) / sqrt_denom; }
+    if mode_select == 0 {
+        response = F::new(1.0) / sqrt_denom;
+    } else if mode_select == 1 {
+        response = f2 / sqrt_denom;
+    } else if mode_select == 2 {
+        response = f / sqrt_denom;
+    } else {
+        response = F::abs(F::new(1.0) - f2) / sqrt_denom;
+    }
     response
 }
 
@@ -35,8 +45,10 @@ fn apply_oberheim_sem<F: Float + CubeElement>(bin_freq: F, cutoff: F, resonance:
 #[cube(launch)]
 pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
     output_stereo_audio: &mut Array<F>,
-    frequency: F, old_frequency: F,
-    dyn_cutoff: F, old_cutoff: F,
+    frequency: F,
+    old_frequency: F,
+    dyn_cutoff: F,
+    old_cutoff: F,
     sample_rate: F,
     lfo_accumulated_phase: F,
     op_ratios: &Array<F>,
@@ -45,7 +57,7 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
     moog_resonance: F,
     oberheim_resonance: F,
     oberheim_mode: u32,
-    lfo_frequency: F, 
+    lfo_frequency: F,
     lfo_depth: F,
     room_size_seconds: F,
     high_freq_damping: F,
@@ -80,10 +92,14 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
 
         // Zeit seit Note-On in Sekunden (immer >= 0)
         let mut t_since_on = (global_sample - t_on) / sample_rate;
-        if t_since_on < F::new(0.0) { t_since_on = F::new(0.0); }
+        if t_since_on < F::new(0.0) {
+            t_since_on = F::new(0.0);
+        }
         // Zeit seit Note-Off in Sekunden (nur relevant wenn Gate zu)
         let mut t_since_off = (global_sample - t_off) / sample_rate;
-        if t_since_off < F::new(0.0) { t_since_off = F::new(0.0); }
+        if t_since_off < F::new(0.0) {
+            t_since_off = F::new(0.0);
+        }
 
         let mut master_amp = F::new(0.0);
 
@@ -124,23 +140,32 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
 
         let block_progress = F::cast_from(n) / samples_per_block;
 
-        let sample_phase_delta = (F::new(2.0) * pi * lfo_frequency * block_progress * samples_per_block) / sample_rate;
+        let sample_phase_delta =
+            (F::new(2.0) * pi * lfo_frequency * block_progress * samples_per_block) / sample_rate;
         let lfo_mod = F::sin(lfo_accumulated_phase + sample_phase_delta);
 
         let base_freq = old_frequency + (block_progress * (frequency - old_frequency));
         let base_cutoff = old_cutoff + (block_progress * (dyn_cutoff - old_cutoff));
-        
+
         let mut modulated_cutoff = base_cutoff + (lfo_mod * lfo_depth);
-        if modulated_cutoff < F::new(50.0) { modulated_cutoff = F::new(50.0); }
+        if modulated_cutoff < F::new(50.0) {
+            modulated_cutoff = F::new(50.0);
+        }
 
         let num_bins = fft_size / 2 + 1;
 
-        let r1 = op_ratios[0]; let l1 = op_levels[0];
-        let r2 = op_ratios[1]; let l2 = op_levels[1];
-        let r3 = op_ratios[2]; let l3 = op_levels[2];
-        let r4 = op_ratios[3]; let l4 = op_levels[3];
-        let r5 = op_ratios[4]; let l5 = op_levels[4];
-        let r6 = op_ratios[5]; let l6 = op_levels[5];
+        let r1 = op_ratios[0];
+        let l1 = op_levels[0];
+        let r2 = op_ratios[1];
+        let l2 = op_levels[1];
+        let r3 = op_ratios[2];
+        let l3 = op_levels[2];
+        let r4 = op_ratios[3];
+        let l4 = op_levels[3];
+        let r5 = op_ratios[4];
+        let l5 = op_levels[4];
+        let r6 = op_ratios[5];
+        let l6 = op_levels[5];
 
         for k in 0..num_bins {
             let k_f = F::cast_from(k);
@@ -150,7 +175,6 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
             let mut imag_spec = F::new(0.0);
 
             if k > 0 && bin_freq < sample_rate / F::new(2.0) {
-                
                 // PERFORMANCE FIX: Ermittle die am nächsten liegende Sägezahn-Harmonische direkt!
                 // Das eliminiert die teure äußere h-Schleife komplett.
                 let h_target_raw = F::floor(bin_freq / F::max(F::new(1.0), base_freq));
@@ -178,15 +202,18 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
                             let c2 = base_freq * r2 * h_f;
                             let op3_mod = l3 * F::max(F::new(0.1), r3);
                             let op4_mod = l4 * F::max(F::new(0.1), r4);
-                            
+
                             carrier_freq = (c1 * l1 + c2 * l2) / F::max(F::new(0.05), l1 + l2);
-                            mod_freq = base_freq * (r3 * l3 + r4 * l4 + r5 * l5 + effective_r6 * l6) / F::max(F::new(0.1), l3 + l4 + l5 + l6);
+                            mod_freq = base_freq
+                                * (r3 * l3 + r4 * l4 + r5 * l5 + effective_r6 * l6)
+                                / F::max(F::new(0.1), l3 + l4 + l5 + l6);
                             modulation_force = op3_mod + op4_mod;
                             carrier_weight = (l1 + l2) * F::new(0.25);
                         } else {
                             carrier_freq = base_freq * r1 * h_f;
                             mod_freq = base_freq * r2;
-                            let raw_stack = l2 * r2 + l3 * r3 + l4 * r4 + l5 * r5 + l6 * effective_r6;
+                            let raw_stack =
+                                l2 * r2 + l3 * r3 + l4 * r4 + l5 * r5 + l6 * effective_r6;
                             modulation_force = F::log1p(raw_stack) * F::new(1.2);
                             carrier_weight = l1 * F::new(0.4);
                         }
@@ -198,18 +225,35 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
                         let dist_down = F::abs(bin_freq - target_freq_down);
                         let bin_width = sample_rate / samples_per_block;
 
-                        if dist_up < bin_width * F::new(0.5) || dist_down < bin_width * F::new(0.5) {
+                        if dist_up < bin_width * F::new(0.5) || dist_down < bin_width * F::new(0.5)
+                        {
                             let mut slot_amplitude = carrier_weight * saw_harmonic_amp;
 
                             if modulation_force > F::new(0.01) {
-                                let fm_damping = F::exp(-(s_f * s_f) / (F::new(2.0) * F::max(F::new(0.1), modulation_force * modulation_force)));
-                                let energy_compensation = F::new(1.0) / F::sqrt(F::new(1.0) + modulation_force);
-                                slot_amplitude = (slot_amplitude + modulation_force * F::new(0.08)) * fm_damping * energy_compensation;
+                                let fm_damping = F::exp(
+                                    -(s_f * s_f)
+                                        / (F::new(2.0)
+                                            * F::max(
+                                                F::new(0.1),
+                                                modulation_force * modulation_force,
+                                            )),
+                                );
+                                let energy_compensation =
+                                    F::new(1.0) / F::sqrt(F::new(1.0) + modulation_force);
+                                slot_amplitude = (slot_amplitude + modulation_force * F::new(0.08))
+                                    * fm_damping
+                                    * energy_compensation;
                             } else {
-                                if sideband > 1 { slot_amplitude = F::new(0.0); }
+                                if sideband > 1 {
+                                    slot_amplitude = F::new(0.0);
+                                }
                             }
 
-                            if k % 2 == 0 { real_spec += slot_amplitude; } else { imag_spec += slot_amplitude; }
+                            if k % 2 == 0 {
+                                real_spec += slot_amplitude;
+                            } else {
+                                imag_spec += slot_amplitude;
+                            }
                         }
                     }
                 }
@@ -217,7 +261,12 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
 
             // Parallel-Filterbank
             let moog_gain: F = apply_moog_ladder::<F>(bin_freq, modulated_cutoff, moog_resonance);
-            let oberheim_gain: F = apply_oberheim_sem::<F>(bin_freq, modulated_cutoff, oberheim_resonance, oberheim_mode); 
+            let oberheim_gain: F = apply_oberheim_sem::<F>(
+                bin_freq,
+                modulated_cutoff,
+                oberheim_resonance,
+                oberheim_mode,
+            );
 
             let combined_filter_gain = (moog_gain + oberheim_gain) * F::new(0.5);
             let filtered_real = real_spec * combined_filter_gain;
@@ -228,10 +277,22 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
             let effective_decay = room_size_seconds / freq_factor;
             let amplitude = F::exp(-k_f / F::max(F::new(1.0), effective_decay * F::new(10.0)));
 
-            let rand_l_real = (F::sin(k_f * F::new(12.9898)) - F::floor(F::sin(k_f * F::new(12.9898)))) * F::new(2.0) - F::new(1.0);
-            let rand_l_imag = (F::cos(k_f * F::new(78.233)) - F::floor(F::cos(k_f * F::new(78.233)))) * F::new(2.0) - F::new(1.0);
-            let rand_r_real = (F::sin(k_f * F::new(45.164)) - F::floor(F::sin(k_f * F::new(45.164)))) * F::new(2.0) - F::new(1.0);
-            let rand_r_imag = (F::cos(k_f * F::new(92.741)) - F::floor(F::cos(k_f * F::new(92.741)))) * F::new(2.0) - F::new(1.0);
+            let rand_l_real = (F::sin(k_f * F::new(12.9898))
+                - F::floor(F::sin(k_f * F::new(12.9898))))
+                * F::new(2.0)
+                - F::new(1.0);
+            let rand_l_imag = (F::cos(k_f * F::new(78.233))
+                - F::floor(F::cos(k_f * F::new(78.233))))
+                * F::new(2.0)
+                - F::new(1.0);
+            let rand_r_real = (F::sin(k_f * F::new(45.164))
+                - F::floor(F::sin(k_f * F::new(45.164))))
+                * F::new(2.0)
+                - F::new(1.0);
+            let rand_r_imag = (F::cos(k_f * F::new(92.741))
+                - F::floor(F::cos(k_f * F::new(92.741))))
+                * F::new(2.0)
+                - F::new(1.0);
 
             let mid_real = (rand_l_real + rand_r_real) * F::new(0.25) * amplitude;
             let mid_imag = (rand_l_imag + rand_r_imag) * F::new(0.25) * amplitude;
@@ -245,5 +306,24 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
 
             let wet_l_real = filtered_real * ir_l_real - filtered_imag * ir_l_imag;
             let wet_l_imag = filtered_real * ir_l_imag + filtered_imag * ir_l_real;
-let wet_r_real = filtered_real * ir_r_real - filtered_imag * ir_r_imag;let wet_r_imag = filtered_real * ir_r_imag + filtered_imag * ir_r_real;let res_l_real = (F::new(1.0) - wet_dry_mix) * filtered_real + wet_dry_mix * wet_l_real;let res_l_imag = (F::new(1.0) - wet_dry_mix) * filtered_imag + wet_dry_mix * wet_l_imag;let res_r_real = (F::new(1.0) - wet_dry_mix) * filtered_real + wet_dry_mix * wet_r_real;let res_r_imag = (F::new(1.0) - wet_dry_mix) * filtered_imag + wet_dry_mix * wet_r_imag;// PHASE FIX: Absolute, blockübergreifend fortlaufende Phasen-Akkumulation!// Das vernichtet das zyklische Block-Eiern vollständig.
-let global_sample_index = (F::cast_from(global_block_index) * samples_per_block) + F::cast_from(n);let angle = (F::new(2.0) * pi * k_f * global_sample_index) / samples_per_block;let cos_a = F::cos(angle);let sin_a = F::sin(angle);final_sample_l += res_l_real * cos_a + res_l_imag * sin_a;final_sample_r += res_r_real * cos_a + res_r_imag * sin_a;}let scale = F::new(2.0) / samples_per_block;let idx_l: usize = (n * 2) as usize;let idx_r: usize = (n * 2 + 1) as usize;output_stereo_audio[idx_l] = final_sample_l * scale * master_amp;output_stereo_audio[idx_r] = final_sample_r * scale * master_amp;}}
+            let wet_r_real = filtered_real * ir_r_real - filtered_imag * ir_r_imag;
+            let wet_r_imag = filtered_real * ir_r_imag + filtered_imag * ir_r_real;
+            let res_l_real = (F::new(1.0) - wet_dry_mix) * filtered_real + wet_dry_mix * wet_l_real;
+            let res_l_imag = (F::new(1.0) - wet_dry_mix) * filtered_imag + wet_dry_mix * wet_l_imag;
+            let res_r_real = (F::new(1.0) - wet_dry_mix) * filtered_real + wet_dry_mix * wet_r_real;
+            let res_r_imag = (F::new(1.0) - wet_dry_mix) * filtered_imag + wet_dry_mix * wet_r_imag; // PHASE FIX: Absolute, blockübergreifend fortlaufende Phasen-Akkumulation!// Das vernichtet das zyklische Block-Eiern vollständig.
+            let global_sample_index =
+                (F::cast_from(global_block_index) * samples_per_block) + F::cast_from(n);
+            let angle = (F::new(2.0) * pi * k_f * global_sample_index) / samples_per_block;
+            let cos_a = F::cos(angle);
+            let sin_a = F::sin(angle);
+            final_sample_l += res_l_real * cos_a + res_l_imag * sin_a;
+            final_sample_r += res_r_real * cos_a + res_r_imag * sin_a;
+        }
+        let scale = F::new(2.0) / samples_per_block;
+        let idx_l: usize = (n * 2) as usize;
+        let idx_r: usize = (n * 2 + 1) as usize;
+        output_stereo_audio[idx_l] = final_sample_l * scale * master_amp;
+        output_stereo_audio[idx_r] = final_sample_r * scale * master_amp;
+    }
+}
