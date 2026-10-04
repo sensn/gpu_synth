@@ -99,7 +99,7 @@ impl WebAudioEngine {
     pub fn new() -> Self {
         Self {
             client: None,
-            fft_size: 2048,
+            fft_size: 512, //2048
             last_cutoff: Cell::new(800.0),
             lfo_phase: Cell::new(0.0),
             block_count: Cell::new(0),

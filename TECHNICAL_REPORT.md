@@ -211,9 +211,22 @@ behavior is preserved while chords play polyphonically alongside it.
 
 ## 5. Frontend (`index.html`)
 
-- **Scheduling:** look-ahead pattern — `setTimeout` loop every 25 ms fills a 100 ms schedule horizon
-  with `AudioBufferSourceNode`s started at `nextStartTime`, guaranteeing glitch-free playback
-  decoupled from GPU readback latency.
+- **Scheduling (AudioWorklet):** a `cubecl-synth-processor` `AudioWorkletProcessor`
+  (`synth_worklet.js`) runs on the real-time audio thread with a FIFO of finished stereo
+  blocks. Flow control is **ack-driven**: whenever the FIFO falls below its target
+  (~3 kernel blocks ≈ 140 ms), the worklet posts an `ack` and the main thread renders one
+  GPU block per request, sequentially (never in parallel — the WASM engine state and GPU
+  pipeline are single-threaded). Blocks are transferred zero-copy (`postMessage` transfer
+  list). This replaces the former `AudioBufferSourceNode` chain scheduling: no node
+  garbage, sample-accurate timing, and gain changes apply instantly inside the audio
+  thread instead of at block granularity.
+- **Resampling:** the kernel renders at a fixed 44.1 kHz; the worklet streams the FIFO
+  into the actual `AudioContext` sample rate with a linear streaming resampler whose
+  fractional position carries across block boundaries (no seam clicks at 48 kHz or other
+  context rates).
+- **Underrun protection:** if the FIFO runs dry (GPU readback jitter, GC pause), the
+  worklet outputs silence and fades back in over 5 ms when data returns — no hard clicks;
+  an underrun counter is reported for debugging.
 - **Smoothing:** all parameters (including per-op ratios/levels) are lerped toward targets at 0.25
   per block (~46 ms time constant), preventing spectral zipper noise; operator arrays are copied into
   fresh `Float32Array`s per block to avoid data races at the WASM boundary. The smoothed frequency
@@ -260,8 +273,10 @@ behavior is preserved while chords play polyphonically alongside it.
    `reverb.rs`) that are dead code on this branch; `#![allow(warnings)]` suppresses diagnostics.
 6. **Hard-coded 44100 Hz** in three places (lib.rs ×2, index.html) — no sample-rate negotiation with
    the AudioContext.
-7. **No `AudioWorklet` integration** — scheduling relies on `AudioBufferSourceNode` chains, which
-   is robust but adds ~one block of latency.
+7. **GPU rendering on the main thread:** the WASM/CubeCL engine renders on the main thread
+   (WebGPU + wasm-bindgen), so a blocked main thread can starve the worklet FIFO (mitigated by
+   the ~3-block FIFO and underrun fade-out; a dedicated worker + its own GPU device would
+   decouple it fully).
 
 > **Resolved in this revision:** the ADSR is no longer block-local, and the engine is no longer
 > monophonic. The envelope is a note-event-driven, absolute-time ADSR (§3.2) driven by a polyphonic
@@ -276,12 +291,14 @@ behavior is preserved while chords play polyphonically alongside it.
 
 - Radix-2 FFT-based spectral engine (cubek `fft` feature is already a dependency) with cross-block
   overlap-add for perfect phase reconstruction.
+- Move the WASM/WebGPU engine into a dedicated `Worker` with its own GPU device so the main
+  thread can never starve the worklet FIFO (the ack protocol already isolates the audio path).
+- Audio-rate parameter automation via `AudioParam` on the worklet node.
 - Batched multi-voice kernel: fold the per-voice launches into a single launch with a voice-index
   dimension (the current design deliberately keeps one launch per voice, §4.1).
 - Per-voice filter/reverb parameters and per-voice operator tables (currently shared globally).
 - Time-domain Moog ladder (the implementation already exists in `synth.rs` legacy code) as a
   post-IDFT pass for authentic resonance behavior.
-- `AudioWorklet` integration for sub-10 ms latency and parameter automation at audio rate.
 - Preset system: the 6×(ratio, level) + algorithm topology maps naturally onto DX7 SysEx-style
   patch storage.
 

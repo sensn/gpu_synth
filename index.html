@@ -203,10 +203,10 @@
 
     let audioEngine;
     let audioContext;
-    let nextStartTime = 0;
+    let workletNode;
     let isPlaying = false;
-    const lookAheadTimeMs = 25.0;
-    const scheduleAheadTime = 0.1;
+    let renderInFlight = false;
+    let pendingRenders = 0;
 
     // Glättungssystem für Basisparameter
     let targets = { freq: 110, cut: 800, att: 0.1, dec: 0.3, sus: 0.7, rel: 0.4, room: 2.5, wet: 0.4, m_res: 1.5, o_res: 0.5, l_frq: 5.0, l_dpt: 300, width: 0.85, damp: 1.2 };
@@ -245,8 +245,31 @@
             );
             console.log("GPU Kernel-Kompilierung (WGSL) abgeschlossen! 🚀 Pipeline ist frei.");
             
-            audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 44100 });
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
             if (audioContext.state === 'suspended') await audioContext.resume();
+
+            // AUDIO-WORKLET: Echtzeit-Audio-Thread mit FIFO + Flow-Control.
+            // Ersetzt das AudioBufferSourceNode-Scheduling (weniger Latenz,
+            // kein Node-Garbage, sample-genaues Timing, Resampling im Worklet).
+            await audioContext.audioWorklet.addModule("./synth_worklet.js");
+            workletNode = new AudioWorkletNode(audioContext, "cubecl-synth-processor", {
+                outputChannelCount: [2],
+                processorOptions: { sampleRateIn: 44100 }
+            });
+            workletNode.port.onmessage = (e) => {
+                const m = e.data;
+                if (m.type === "ack") {
+                    // Bedarfsgesteuerte GPU-Pumpe: Anfragen in die Render-Warteschlange
+                    // (sequenziell abgearbeitet — der WASM-Engine-Zustand ist nicht
+                    // nebenläufigkeitssicher, renderInFlight serialisiert).
+                    pendingRenders += m.count;
+                    pumpRenders();
+                } else if (m.type === "meter") {
+                    updateVuMeter(m.peakL, m.peakR);
+                }
+            };
+            workletNode.connect(audioContext.destination);
+            console.log("AudioWorklet läuft. Kernel-Rate 44100 Hz → Context-Rate " + audioContext.sampleRate + " Hz (Resampling im Worklet).");
             
             // Drone-Modus: eigene Drone-Stimme auf Slider-Frequenz, damit der
             // Sound wie vorher sofort startet (Polyphonie: Tastatur kommt dazu)
@@ -257,53 +280,61 @@
             
             document.getElementById("start-btn").disabled = true;
             document.getElementById("start-btn").innerText = "Engine läuft 🟢";
-            nextStartTime = audioContext.currentTime + 0.15;
             isPlaying = true;
-            schedulerLoop();
+            // Deterministischer Start: Worklet fordert per prime die ersten
+            // Blöcke an, danach läuft das ack-Protokoll im Gleichgewicht.
+            workletNode.port.postMessage({ type: "prime" });
         } catch (e) { console.error("Kritischer Fehler beim Starten:", e); }
     }
 
-    async function schedulerLoop() {
-        if (!isPlaying) return;
-        while (nextStartTime < audioContext.currentTime + scheduleAheadTime) { await spawnGpuBlock(); }
-        setTimeout(schedulerLoop, lookAheadTimeMs);
+    // Bedarfsgesteuerte GPU-Pumpe: Der Worklet fordert Blöcke per ack an; hier
+    // wird sequenziell gerendert (nie parallel — Engine-Zustand + GPU-Pipeline
+    // sind single-threaded). pendingRenders (oben deklariert) zählt offene Anfragen.
+
+    function pumpRenders() {
+        while (pendingRenders > 0 && !renderInFlight) {
+            pendingRenders--;
+            spawnGpuBlock();
+        }
     }
 
     async function spawnGpuBlock() {
-        targets.freq = parseFloat(document.getElementById("freq-slider").value);
-        targets.cut = parseFloat(document.getElementById("cutoff-slider").value);
-        targets.att = parseFloat(document.getElementById("attack-slider").value);
-        targets.dec = parseFloat(document.getElementById("decay-slider").value);
-        targets.sus = parseFloat(document.getElementById("sustain-slider").value) / 100.0;
-        targets.rel = parseFloat(document.getElementById("release-slider").value);
-        targets.room = parseFloat(document.getElementById("room-slider").value);
-        targets.wet = parseFloat(document.getElementById("wet-slider").value) / 100.0;
-        targets.m_res = parseFloat(document.getElementById("moog-res-slider").value);
-        targets.o_res = parseFloat(document.getElementById("obe-res-slider").value);
-        targets.l_frq = parseFloat(document.getElementById("lfo-freq-slider").value);
-        targets.l_dpt = parseFloat(document.getElementById("lfo-depth-slider").value);
-        targets.width = parseFloat(document.getElementById("width-slider").value) / 100.0;
-        targets.damp = parseFloat(document.getElementById("damping-slider").value);
-        
-        const algo = parseInt(document.getElementById("algo-select").value);
-        const obeMode = parseInt(document.getElementById("obe-mode-select").value);
-        const volumeGain = parseFloat(document.getElementById("gain-slider").value);
-
-        for (let i = 0; i < 6; i++) {
-            targetRatios[i] = parseFloat(document.getElementById(`op${i+1}-ratio-slider`).value);
-            targetLevels[i] = parseFloat(document.getElementById(`op${i+1}-level-slider`).value);
-            
-            currentRatios[i] += 0.25 * (targetRatios[i] - currentRatios[i]);
-            currentLevels[i] += 0.25 * (targetLevels[i] - currentLevels[i]);
-        }
-
-        for (let key in targets) { current[key] += 0.25 * (targets[key] - current[key]); }
-
-        // Isoliertes Array-Gating gegen Data-Races an der WASM-Kopplung
-        const sendRatios = new Float32Array(currentRatios);
-        const sendLevels = new Float32Array(currentLevels);
-
+        if (!isPlaying || renderInFlight) return;
+        renderInFlight = true;
         try {
+            targets.freq = parseFloat(document.getElementById("freq-slider").value);
+            targets.cut = parseFloat(document.getElementById("cutoff-slider").value);
+            targets.att = parseFloat(document.getElementById("attack-slider").value);
+            targets.dec = parseFloat(document.getElementById("decay-slider").value);
+            targets.sus = parseFloat(document.getElementById("sustain-slider").value) / 100.0;
+            targets.rel = parseFloat(document.getElementById("release-slider").value);
+            targets.room = parseFloat(document.getElementById("room-slider").value);
+            targets.wet = parseFloat(document.getElementById("wet-slider").value) / 100.0;
+            targets.m_res = parseFloat(document.getElementById("moog-res-slider").value);
+            targets.o_res = parseFloat(document.getElementById("obe-res-slider").value);
+            targets.l_frq = parseFloat(document.getElementById("lfo-freq-slider").value);
+            targets.l_dpt = parseFloat(document.getElementById("lfo-depth-slider").value);
+            targets.width = parseFloat(document.getElementById("width-slider").value) / 100.0;
+            targets.damp = parseFloat(document.getElementById("damping-slider").value);
+            
+            const algo = parseInt(document.getElementById("algo-select").value);
+            const obeMode = parseInt(document.getElementById("obe-mode-select").value);
+            const volumeGain = parseFloat(document.getElementById("gain-slider").value);
+
+            for (let i = 0; i < 6; i++) {
+                targetRatios[i] = parseFloat(document.getElementById(`op${i+1}-ratio-slider`).value);
+                targetLevels[i] = parseFloat(document.getElementById(`op${i+1}-level-slider`).value);
+                
+                currentRatios[i] += 0.25 * (targetRatios[i] - currentRatios[i]);
+                currentLevels[i] += 0.25 * (targetLevels[i] - currentLevels[i]);
+            }
+
+            for (let key in targets) { current[key] += 0.25 * (targets[key] - current[key]); }
+
+            // Isoliertes Array-Gating gegen Data-Races an der WASM-Kopplung
+            const sendRatios = new Float32Array(currentRatios);
+            const sendLevels = new Float32Array(currentLevels);
+
             const audioData = await audioEngine.render_block_async(
                 current.freq, current.cut, current.room, current.wet, current.att, current.dec,
                 current.sus, current.rel,
@@ -311,28 +342,21 @@
                 current.l_frq, current.l_dpt, current.width, current.damp
             );
 
+            // Interleaved → getrennte L/R-Arrays, zero-copy in den Worklet
             const bufferSize = audioData.length / 2;
-            const audioBuffer = audioContext.createBuffer(2, bufferSize, 44100);
-            const leftChannel = audioBuffer.getChannelData(0);
-            const rightChannel = audioBuffer.getChannelData(1);
-            let maxPeakL = 0.0, maxPeakR = 0.0;
-
+            const l = new Float32Array(bufferSize);
+            const r = new Float32Array(bufferSize);
             for (let i = 0; i < bufferSize; i++) {
-                const lSample = audioData[i * 2] * volumeGain;
-                const rSample = audioData[i * 2 + 1] * volumeGain;
-                leftChannel[i] = lSample; rightChannel[i] = rSample;
-                const absL = Math.abs(lSample), absR = Math.abs(rSample);
-                if (absL > maxPeakL) maxPeakL = absL; if (absR > maxPeakR) maxPeakR = absR;
+                l[i] = audioData[i * 2];
+                r[i] = audioData[i * 2 + 1];
             }
-
-            updateVuMeter(maxPeakL, maxPeakR);
-            const bufferSource = audioContext.createBufferSource();
-            bufferSource.buffer = audioBuffer;
-            bufferSource.connect(audioContext.destination);
-            bufferSource.start(nextStartTime);
-            nextStartTime += bufferSize / 44100;
+            // Gain im Worklet anwenden lassen (reagiert sofort auf Slider-Änderung)
+            workletNode.port.postMessage({ type: "gain", value: volumeGain }, []);
+            workletNode.port.postMessage({ type: "block", l: l, r: r }, [l.buffer, r.buffer]);
 
         } catch (gpuError) { console.error("WebGPU Pipeline Stau:", gpuError); }
+        renderInFlight = false;
+        pumpRenders(); // nächste offene Anfrage sofort bedienen
     }
 
     function updateVuMeter(peakL, peakR) {
@@ -343,7 +367,11 @@
     }
 
     document.getElementById("start-btn").addEventListener("click", startEngine);
-    document.getElementById("gain-slider").addEventListener("input", (e) => document.getElementById("gain-val").innerText = e.target.value + "x");
+    document.getElementById("gain-slider").addEventListener("input", (e) => {
+        document.getElementById("gain-val").innerText = e.target.value + "x";
+        // Gain live in den Worklet-Thread pushen (reagiert ohne Block-Verzögerung)
+        if (workletNode) workletNode.port.postMessage({ type: "gain", value: parseFloat(e.target.value) });
+    });
     document.getElementById("attack-slider").addEventListener("input", (e) => document.getElementById("attack-val").innerText = parseFloat(e.target.value).toFixed(2) + "s");
     document.getElementById("decay-slider").addEventListener("input", (e) => document.getElementById("decay-val").innerText = parseFloat(e.target.value).toFixed(2) + "s");
     document.getElementById("freq-slider").addEventListener("input", (e) => document.getElementById("freq-val").innerText = e.target.value + " Hz");
