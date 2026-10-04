@@ -88,10 +88,11 @@ modulated_cutoff = clamp(base_cutoff + lfo_mod·lfo_depth, 50 Hz, ∞)
 ```
 
 Cross-block state (`old_frequency`, `old_cutoff`, `lfo_phase`, `global_block_index`, plus the note-event
-cells `gate_on`, `note_on_sample`, `note_off_sample`) is threaded through the kernel as runtime
-arguments, eliminating the per-block discontinuity ("Block-Eiern") of earlier versions —
-frequency/cutoff ramps, LFO phase, and the ADSR envelope all continue seamlessly across block
-boundaries. The gate flag is passed as `u32` (1/0) since cubecl runtime arguments do not include `bool`.
+fields `gate_on`, `note_on_sample`, `note_off_sample`) is threaded through the kernel as runtime
+arguments — **per voice** in the polyphonic engine (§4.1) — eliminating the per-block discontinuity
+("Block-Eiern") of earlier versions: frequency/cutoff ramps, LFO phase, and the ADSR envelope all
+continue seamlessly across block boundaries. The gate flag is passed as `u32` (1/0) since cubecl
+runtime arguments do not include `bool`.
 
 ### 3.3 Spectral Synthesis: Sawtooth + FM Sidebands
 
@@ -161,34 +162,50 @@ interleaved L/R (`out[2n]`, `out[2n+1]`).
 ## 4. Host Layer (`src/lib.rs`)
 
 - **`WebAudioEngine`**: `#[wasm_bindgen]` struct holding `Option<ComputeClient<WgpuRuntime>>` plus
-  seven `Cell` state fields (frequency/cutoff/LFO/block counters + gate/note-on/note-off state).
-  Interior mutability via `Cell` is required because `render_block_async(&self)` takes `&self` while
-  mutating phase/block counters.
+  `Cell` state fields (cutoff/LFO/block counters) and a `RefCell<[Voice; 8]>` voice table
+  (per-voice gate/note-on/note-off/pitch state, §4.1). Interior mutability via `Cell`/`RefCell` is
+  required because `render_block_async(&self)` takes `&self` while mutating counters and voices.
 - **`init_engine_async`**: `future_to_promise` wrapping `cubecl_wgpu::init_setup_async::<WebGpu>` →
   `init_device` → `ComputeClient::load`. Async is mandatory: WebGPU device acquisition is
   promise-based in the browser.
-- **`render_block_async`**: allocates the 4096-float output handle + two 6-float operator arrays via
-  `bytemuck::cast_slice` → `cubecl::bytes::Bytes` → `client.create`, launches the kernel with 29
-  arguments (27 runtime + `#[comptime] fft_size`), updates state cells, and returns a promise that
-  resolves to a `Float32Array` after `client.read_async`.
+- **`render_block_async`**: allocates one 4096-float output handle **per active voice** plus two
+  shared 6-float operator arrays via `bytemuck::cast_slice` → `cubecl::bytes::Bytes` →
+  `client.create`, launches the kernel **once per voice** with 29 arguments (27 runtime +
+  `#[comptime] fft_size`) — per-voice note state, shared global parameters — then mixes the
+  read-back buffers with equal-power scaling and resolves to a single `Float32Array` after one
+  collective `client.read_async`. With no active voices a single silent dummy launch keeps the
+  WGSL pipeline warm (gate closed, `t_off == t_on` ⇒ exact zeros).
 - **Parameter contract (18 JS args → 29 kernel args):** frequency, cutoff, room_size, wet_mix,
   attack, decay, sustain, release, ratios[6], levels[6], algo_select, moog_res, obe_res, obe_mode,
   lfo_freq, lfo_depth, stereo_width, hf_damping — plus host-injected old_freq, old_cutoff,
   sample_rate, lfo_phase, gate flag, note_on_sample, note_off_sample, block_index, fft_size.
 
-### 4.1 Note-Event API (monophonic)
+### 4.1 Note-Event API (polyphonic voice table)
 
-- **`note_on(frequency)`** — opens the gate at the start of the next block, records
-  `note_on_sample = block_count·fft_size`, and snaps `last_frequency` to the new pitch.
-- **`note_off()`** — closes the gate, records `note_off_sample = block_count·fft_size`.
-- **`is_gate_on()`** — gate state for UI feedback.
+The engine maintains a fixed-size voice table (`MAX_VOICES = 8`). Each voice carries its own
+gate/note state (`gate_on`, `note_on_sample`, `note_off_sample`, `frequency`, `old_frequency`,
+`is_drone`); every active voice is rendered by **exactly one kernel launch per block** with the
+same compiled kernel (§3), and the per-voice stereo buffers are mixed on the CPU with
+equal-power scaling (`1/√N`) to prevent clipping on chords.
+
+- **`note_on(frequency)`** — voice allocation: (1) a still-held voice with the same pitch is
+  retriggered (ADSR restart); (2) a free slot is used; (3) the oldest releasing voice is
+  recycled; (4) otherwise the oldest held voice is stolen. `note_on_sample = block_count·fft_size`.
+- **`note_off(frequency)`** — closes the gate of the held voice matching that frequency and
+  records `note_off_sample`; its release tail continues until `5× release` has elapsed, then the
+  slot is freed.
+- **`set_drone(on, frequency)`** — a dedicated drone voice that note events never touch (no
+  retrigger, no stealing, no note-off); it follows the frequency slider (legacy behavior), while
+  keyboard voices keep their own pitches.
+- **`is_gate_on()` / `active_voice_count()` / `get_lead_frequency()`** — UI feedback: any gate
+  open, occupied voices, and the pitch of the voice the frequency slider controls.
 
 Because the envelope is evaluated against absolute sample positions, a note held across many blocks
 produces a single continuous A→D→S curve, and a release started in one block decays smoothly through
-all subsequent blocks. Retriggering (`note_on` while gate open) restarts the attack from zero at the
-next block boundary. The frontend maps computer keys (A W S E D F T G Z H U J K O L) and an on-screen
-piano to these calls; a "Drone-Modus" checkbox keeps the gate permanently open to reproduce the
-legacy continuous-sound behavior.
+all subsequent blocks — per voice. Retriggering restarts the attack from zero at the next block
+boundary. The frontend maps computer keys (A W S E D F T G Z H U J K O L) and an on-screen piano to
+these calls; the "Drone-Modus" checkbox spawns the drone voice so the legacy continuous-sound
+behavior is preserved while chords play polyphonically alongside it.
 
 ---
 
@@ -199,8 +216,9 @@ legacy continuous-sound behavior.
   decoupled from GPU readback latency.
 - **Smoothing:** all parameters (including per-op ratios/levels) are lerped toward targets at 0.25
   per block (~46 ms time constant), preventing spectral zipper noise; operator arrays are copied into
-  fresh `Float32Array`s per block to avoid data races at the WASM boundary. Note events snap
-  `current.freq`/`targets.freq` directly (no glide) so the pitch is exact at note-on.
+  fresh `Float32Array`s per block to avoid data races at the WASM boundary. The smoothed frequency
+  drives the **lead voice** only (drone voice, or newest held note without drone); other voices hold
+  their pitch, so chords stay in tune while the lead can glide.
 - **Metering:** per-block peak → dB → −45..0 dB window → CSS-width VU bars with gradient.
 - **UI:** 8 tabs (Master/VCA with A/D/S/R sliders, 6 operator tabs, Filter & Reverb), on-screen
   piano + computer-keyboard note input, drone-mode toggle, DX7-inspired defaults
@@ -234,22 +252,23 @@ legacy continuous-sound behavior.
    zero-shared-state design deliberately avoids.
 2. **Spectral resolution vs. pitch:** bin width is 21.5 Hz; low fundamentals get quantized harmonic
    placement (mitigated by the ±0.5-bin slot window and the 3-harmonic scan window).
-3. **Monophonic note events only:** the note-event ADSR (§3.2, §4.1) supports a single voice —
-   `note_on` while the gate is open retriggers rather than stacking. Polyphony would need per-voice
-   gate/note state and either multiple kernel launches or voice-indexed argument arrays.
+3. **Voice stealing is a hard cut:** when all 8 slots are held, the oldest voice is stolen without a
+   fade-out, which can click. A short pre-render ramp would fix this (out of scope).
 4. **Filter resonance models are magnitude-only:** no phase response, so self-oscillation and true
    ladder nonlinearity are not modeled.
 5. **Repo hygiene:** `src/` contains 8+ "Copy N" variant files and legacy modules (`synth.rs`,
    `reverb.rs`) that are dead code on this branch; `#![allow(warnings)]` suppresses diagnostics.
 6. **Hard-coded 44100 Hz** in three places (lib.rs ×2, index.html) — no sample-rate negotiation with
    the AudioContext.
-7. **No polyphony/voice management** and no `AudioWorklet` integration — scheduling relies on
-   `AudioBufferSourceNode` chains, which is robust but adds ~one block of latency.
+7. **No `AudioWorklet` integration** — scheduling relies on `AudioBufferSourceNode` chains, which
+   is robust but adds ~one block of latency.
 
-> **Resolved in this revision:** the ADSR is no longer block-local. The envelope is now a
-> note-event-driven, absolute-time ADSR (§3.2) with a monophonic `note_on`/`note_off` API (§4.1),
-> sustain/release controls, and a piano/keyboard UI. The legacy drone behavior is preserved via the
-> "Drone-Modus" toggle.
+> **Resolved in this revision:** the ADSR is no longer block-local, and the engine is no longer
+> monophonic. The envelope is a note-event-driven, absolute-time ADSR (§3.2) driven by a polyphonic
+> voice table (§4.1): per-voice gate/note-on/note-off state, one kernel launch per voice per block,
+> CPU equal-power mixing, voice stealing with release-tail recycling, and a dedicated drone voice.
+> Sustain/release controls and the piano/keyboard UI carry over; the legacy drone behavior is preserved
+> via the "Drone-Modus" toggle.
 
 ---
 
@@ -257,9 +276,9 @@ legacy continuous-sound behavior.
 
 - Radix-2 FFT-based spectral engine (cubek `fft` feature is already a dependency) with cross-block
   overlap-add for perfect phase reconstruction.
-- **Polyphony:** extend the note-event layer with a voice table (per-voice gate/note-on/note-off
-  state, voice-indexed operator arrays or one kernel launch per voice) — the monophonic ADSR
-  groundwork (§3.2/§4.1) is the first step toward this.
+- Batched multi-voice kernel: fold the per-voice launches into a single launch with a voice-index
+  dimension (the current design deliberately keeps one launch per voice, §4.1).
+- Per-voice filter/reverb parameters and per-voice operator tables (currently shared globally).
 - Time-domain Moog ladder (the implementation already exists in `synth.rs` legacy code) as a
   post-IDFT pass for authentic resonance behavior.
 - `AudioWorklet` integration for sub-10 ms latency and parameter automation at audio rate.

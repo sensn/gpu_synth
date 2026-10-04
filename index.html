@@ -193,7 +193,7 @@
         <div class="piano" id="piano-container"></div>
         <div class="drone-toggle">
             <input type="checkbox" id="drone-mode" checked>
-            <label for="drone-mode">Drone-Modus (Gate dauerhaft offen — alter Verhalten)</label>
+            <label for="drone-mode">Drone-Modus (dauerhafte Drone-Stimme auf Slider-Frequenz — Tastatur klingt polyphon dazu)</label>
             <span class="gate-status" id="gate-status">Gate: OFF</span>
         </div>
     </div>
@@ -248,9 +248,10 @@
             audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 44100 });
             if (audioContext.state === 'suspended') await audioContext.resume();
             
-            // Drone-Modus: Gate sofort öffnen, damit der Sound wie vorher sofort startet
+            // Drone-Modus: eigene Drone-Stimme auf Slider-Frequenz, damit der
+            // Sound wie vorher sofort startet (Polyphonie: Tastatur kommt dazu)
             if (document.getElementById("drone-mode").checked) {
-                audioEngine.note_on(110.0);
+                audioEngine.set_drone(true, 110.0);
                 updateGateStatus();
             }
             
@@ -389,20 +390,20 @@
         const octave = Math.floor((semi + 9) / 12) + 2;
         key.innerHTML = `<span class="key-note">${noteName}${octave}</span><span class="key-label">${KEY_LABELS[semi] || ''}</span>`;
         key.addEventListener("mousedown", () => triggerNoteOn(semi, key));
-        key.addEventListener("mouseup", () => triggerNoteOff(key));
-        key.addEventListener("mouseleave", () => triggerNoteOff(key));
+        key.addEventListener("mouseup", () => triggerNoteOff(semi, key));
+        key.addEventListener("mouseleave", (e) => { if (e.buttons & 1) triggerNoteOff(semi, key); });
         pianoContainer.appendChild(key);
     }
 
     function updateGateStatus() {
         const el = document.getElementById("gate-status");
-        if (el && audioEngine) el.innerText = "Gate: " + (audioEngine.is_gate_on() ? "ON" : "OFF");
+        if (el && audioEngine) el.innerText = "Voices: " + audioEngine.active_voice_count() + " | Gate: " + (audioEngine.is_gate_on() ? "ON" : "OFF");
     }
 
     function triggerNoteOn(semi, keyElement) {
         if (!audioEngine) return;
         const freq = semitoneToFreq(semi);
-        // Frequenz-Slider synchronisieren, damit die Glättung folgt
+        // Frequenz-Slider synchronisieren, damit die Glättung folgt (Lead-Stimme)
         document.getElementById("freq-slider").value = freq.toFixed(0);
         document.getElementById("freq-val").innerText = freq.toFixed(0) + " Hz";
         audioEngine.note_on(freq);
@@ -410,11 +411,18 @@
         updateGateStatus();
     }
 
-    function triggerNoteOff(keyElement) {
+    function triggerNoteOff(semi, keyElement) {
         if (!audioEngine) return;
-        if (document.getElementById("drone-mode").checked) return; // Drone: Gate bleibt offen
-        audioEngine.note_off();
+        const freq = semitoneToFreq(semi);
+        audioEngine.note_off(freq);
         if (keyElement) keyElement.classList.remove("active");
+        // Slider auf die neue Lead-Stimme synchronisieren, damit die
+        // verbleibende gehaltene Stimme nicht auf die alte Tonhöhe gezogen wird.
+        const lead = audioEngine.get_lead_frequency();
+        if (lead > 0) {
+            document.getElementById("freq-slider").value = lead.toFixed(0);
+            document.getElementById("freq-val").innerText = lead.toFixed(0) + " Hz";
+        }
         updateGateStatus();
     }
 
@@ -435,18 +443,22 @@
         heldKeys.delete(k);
         const semi = KEY_TO_SEMITONE[k];
         const keyEl = document.querySelector(`.key[data-semitone="${semi}"]`);
-        triggerNoteOff(keyEl);
+        triggerNoteOff(semi, keyEl);
     });
 
-    // Drone-Modus Toggle
+    // Drone-Modus Toggle: eigene Drone-Stimme auf Slider-Frequenz.
+    // Note-Events treffen sie nie — Tastatur-Akkorde klingen zusätzlich.
     document.getElementById("drone-mode").addEventListener("change", (e) => {
         if (!audioEngine) return;
-        if (e.target.checked) {
-            const f = parseFloat(document.getElementById("freq-slider").value);
-            targets.freq = f; current.freq = f;
-            audioEngine.note_on(f);
-        } else {
-            audioEngine.note_off();
+        const f = parseFloat(document.getElementById("freq-slider").value);
+        audioEngine.set_drone(e.target.checked, f);
+        // Drone aus: Slider auf die verbleibende Lead-Stimme synchronisieren
+        if (!e.target.checked) {
+            const lead = audioEngine.get_lead_frequency();
+            if (lead > 0) {
+                document.getElementById("freq-slider").value = lead.toFixed(0);
+                document.getElementById("freq-val").innerText = lead.toFixed(0) + " Hz";
+            }
         }
         updateGateStatus();
     });
