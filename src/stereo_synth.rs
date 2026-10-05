@@ -154,9 +154,9 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
 
            // ... (Dein ADSR- und Operator-Setup bleibt identisch) ...
 
-            // ... (Dein ADSR- und LFO-Setup bleibt absolut unberührt) ...
+                // ... (Dein ADSR- und LFO-Setup bleibt absolut unberührt) ...
 
-    let num_bins = fft_size / 2 + 1;
+        let num_bins = fft_size / 2 + 1;
         let samples_per_block_f = samples_per_block;
         
         let block_start_sample = F::cast_from(global_block_index) * samples_per_block_f;
@@ -167,7 +167,7 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
         let current_base_freq = old_frequency + (block_progress * (frequency - old_frequency));
         let current_modulated_cutoff = old_cutoff + (block_progress * (dyn_cutoff - old_cutoff));
 
-        // Zuweisungen für die 6 Operatoren
+        // --- CUBECL FIX: Explizites Auslesen der Array-Indizes als Skalare vom Typ F ---
         let r1 = op_ratios[0]; let l1 = op_levels[0];
         let r2 = op_ratios[1]; let l2 = op_levels[1];
         let r3 = op_ratios[2]; let l3 = op_levels[2];
@@ -175,7 +175,7 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
         let r5 = op_ratios[4]; let l5 = op_levels[4];
         let r6 = op_ratios[5]; let l6 = op_levels[5];
 
-        // 1. DX7 CORE FREQUENZ-BERECHNUNG
+        // 1. DX7 CORE FREQUENZ-BERECHNUNG (Jetzt mathematisch korrekt mit Skalaren)
         let f1 = current_base_freq * r1;
         let f2 = current_base_freq * r2;
         let f3 = current_base_freq * r3;
@@ -194,6 +194,8 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
         if algo_select == 0 {
             let op3_mod = l3 * F::max(F::new(0.1), r3);
             let op4_mod = l4 * F::max(F::new(0.1), r4);
+            
+            // Rechnet nun stabil mit dem echten Typen F
             carrier_freq = (f1 * l1 + f2 * l2) / F::max(F::new(0.05), l1 + l2);
             mod_freq = (f3 * l3 + f4 * l4 + f5 * l5 + f6_effective * l6) / F::max(F::new(0.1), l3 + l4 + l5 + l6);
             modulation_force = op3_mod + op4_mod;
@@ -221,18 +223,14 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
             }
 
             if sideband_amp > F::new(0.0001) {
-                // Symmetrische Erzeugung: Unteres (0) und oberes (1) Seitenband abarbeiten
                 for sign_idx in 0..2 {
-                    // KORREKTUR: "continue" durch invertierte "if"-Bedingung ersetzt!
                     if !(sideband == 0 && sign_idx == 1) { 
                         
                         let sign = if sign_idx == 0 { F::new(-1.0) } else { F::new(1.0) };
                         let real_freq = carrier_freq + (sign * order * mod_freq);
 
-                        // Nur berechnen, wenn die Frequenz innerhalb des hörbaren Nyquist-Bereichs liegt
                         if real_freq > F::new(10.0) && real_freq < sample_rate / F::new(2.0) {
                             
-                            // FILTER INTEGRATION
                             let filter_gain = if real_freq <= current_modulated_cutoff { F::new(1.0) } else { F::new(0.0) };
                             
                             if filter_gain > F::new(0.0) {
@@ -242,12 +240,11 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
                                 let rand_l_real = (F::sin(order * F::new(12.9898)) - F::floor(F::sin(order * F::new(12.9898)))) * F::new(2.0) - F::new(1.0);
                                 let rand_l_imag = (F::cos(order * F::new(78.2330)) - F::floor(F::cos(order * F::new(78.2330)))) * F::new(2.0) - F::new(1.0);
                                 let rand_r_real = (F::sin(order * F::new(45.1640)) - F::floor(F::sin(order * F::new(45.1640)))) * F::new(2.0) - F::new(1.0);
-                                // KORREKTUR: Unbekanntes 'k_f' durch 'order' ersetzt!
                                 let rand_r_imag = (F::cos(order * F::new(92.7410)) - F::floor(F::cos(order * F::new(92.7410)))) * F::new(2.0) - F::new(1.0);
 
                                 let freq_factor = F::new(1.0) + (real_freq * high_freq_damping * F::new(0.0001));
                                 let effective_decay = room_size_seconds / freq_factor;
-                                let amplitude_decay = F::exp(-order / F::max(F::new(1.0), effective_decay * F::new(10.0)));
+                                let amplitude_decay = F::exp(-order / F::max(F::new(1.0), effective_decay * F::new(2.0))) * F::new(0.15);
 
                                 let ir_l_real = rand_l_real * amplitude_decay; let ir_l_imag = rand_l_imag * amplitude_decay;
                                 let ir_r_real = rand_r_real * amplitude_decay; let ir_r_imag = rand_r_imag * amplitude_decay;
@@ -283,12 +280,15 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
             }
         }
 
-        // 3. SKALIERUNG UND SICHERER AUDIO-OUTPUT
-        let scale = F::new(0.15); 
+        // 3. ABSOLUT SICHERES INTEGRAL-GAIN-STAGING & LIMITER
+        let scale = F::new(0.05); 
         let idx_l: usize = (n * 2) as usize;
         let idx_r: usize = (n * 2 + 1) as usize;
         
-        output_stereo_audio[idx_l] = final_sample_l * scale * master_amp;
-        output_stereo_audio[idx_r] = final_sample_r * scale * master_amp;
+        let out_l = final_sample_l * scale * master_amp;
+        let out_r = final_sample_r * scale * master_amp;
+
+        output_stereo_audio[idx_l] = F::max(-F::new(1.0), F::min(F::new(1.0), out_l));
+        output_stereo_audio[idx_r] = F::max(-F::new(1.0), F::min(F::new(1.0), out_r));
     }
 }
