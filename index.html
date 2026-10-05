@@ -235,6 +235,17 @@
             await init();
             let rawEngine = new WebAudioEngine();
             audioEngine = await rawEngine.init_engine_async();
+
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            if (audioContext.state === 'suspended') await audioContext.resume();
+
+            // SAMPLERATE-VERHANDLUNG: Der Kernel rendert direkt auf der echten
+            // Context-Rate (z.B. 48000 Hz) — kein Resampling. Muss VOR dem
+            // Warm-Up passieren, damit WGSL-Kompilierung + ADSR-Zeitbasis von
+            // Anfang an auf der echten Rate arbeiten.
+            audioEngine.set_sample_rate(audioContext.sampleRate);
+            console.log("Samplerate verhandelt: " + audioContext.sampleRate + " Hz (Kernel rendert nativ, kein Resampling).");
+
             console.log("CubeCL WebAudioEngine geladen. Starte GPU-Warm-Up... ⚙️");
             
             // Warm-Up Parameteraufruf exakt an die 18 Parameter der lib.rs angepasst
@@ -244,9 +255,6 @@
                 5.0, 300.0, 0.85, 1.2
             );
             console.log("GPU Kernel-Kompilierung (WGSL) abgeschlossen! 🚀 Pipeline ist frei.");
-            
-            audioContext = new (window.AudioContext || window.webkitAudioContext)();
-            if (audioContext.state === 'suspended') await audioContext.resume();
 
             // AUDIO-WORKLET: Echtzeit-Audio-Thread mit FIFO + Flow-Control.
             // Ersetzt das AudioBufferSourceNode-Scheduling (weniger Latenz,
@@ -254,7 +262,7 @@
             await audioContext.audioWorklet.addModule("./synth_worklet.js");
             workletNode = new AudioWorkletNode(audioContext, "cubecl-synth-processor", {
                 outputChannelCount: [2],
-                processorOptions: { sampleRateIn: 44100 }
+                processorOptions: { sampleRateIn: audioContext.sampleRate }
             });
             workletNode.port.onmessage = (e) => {
                 const m = e.data;
@@ -269,7 +277,7 @@
                 }
             };
             workletNode.connect(audioContext.destination);
-            console.log("AudioWorklet läuft. Kernel-Rate 44100 Hz → Context-Rate " + audioContext.sampleRate + " Hz (Resampling im Worklet).");
+            console.log("AudioWorklet läuft. Kernel-Rate = Context-Rate = " + audioContext.sampleRate + " Hz (Resampler ist 1:1-Passthrough).");
             
             // Drone-Modus: eigene Drone-Stimme auf Slider-Frequenz, damit der
             // Sound wie vorher sofort startet (Polyphonie: Tastatur kommt dazu)

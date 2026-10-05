@@ -16,9 +16,10 @@
 // Eigenschaften:
 //   - Kein AudioBufferSourceNode-Chain-Scheduling mehr: kein Node-Garbage,
 //     sample-genaues Timing, Gain-Änderungen wirken sofort (im Audio-Thread).
-//   - Streaming-Resampler (linear) mit fraktionalem Positions-Carry über
-//     Blockgrenzen: Kernel-Rate 44100 Hz → echte Context-Rate (z.B. 48000),
-//     ohne Knacks an den Blockübergängen.
+//   - SAMPLERATE: Der Kernel rendert nativ auf der Context-Rate — kein
+//     Resampling. Der lineare Streaming-Resampler bleibt als Sicherheitsnetz
+//     mit ratio = 1.0 aktiv (falls sampleRateIn je von der Context-Rate
+//     abweichen sollte, bleibt der Code korrekt).
 //   - Underrun-Schutz: bei leerem FIFO Stille + 5 ms Einblendrampe beim
 //     Wiederkommen (kein harter Knacks), Underrun-Zähler fürs Debugging.
 //   - Ack-Protokoll (bedarfsgesteuerte GPU-Pumpe): der Worklet fordert genau
@@ -31,9 +32,9 @@
 
 const WORKLET_NAME = "cubecl-synth-processor";
 
-// FIFO-Ziel: ~3 Kernel-Blöcke (2048 Samples @ 44.1 kHz ≈ 46 ms pro Block).
-// 1 Block wird konsumiert + 2 Reserve für GPU-Readback-Jitter/GC-Pausen.
-// Latenz-Abwägung: 2 = ~93 ms (aggressiv), 3 = ~140 ms (sicher). 
+// FIFO-Ziel: ~3 Kernel-Blöcke. Bei fft_size=512 ≈ 11 ms pro Block @ 44.1 kHz
+// (≈ 10.7 ms @ 48 kHz) → ~35 ms Latenz; bei fft_size=2048 ≈ 46 ms → ~140 ms.
+// 1 Block wird konsumiert + Reserve für GPU-Readback-Jitter/GC-Pausen.
 const TARGET_QUEUE = 3;
 
 // Metering alle 8 Render-Quanten (8 × 128 Samples ≈ 23 ms @ 44.1 kHz) —
@@ -44,7 +45,9 @@ class SynthWorkletProcessor extends AudioWorkletProcessor {
     constructor(options) {
         super();
         const opts = (options && options.processorOptions) || {};
-        this.sampleRateIn = opts.sampleRateIn || 44100;
+        // Kernel-Rate = Context-Rate (kein Resampling); Fallback nur falls
+        // processorOptions fehlen sollten.
+        this.sampleRateIn = opts.sampleRateIn || sampleRate;
         // FIFO: {l: Float32Array, r: Float32Array}
         this.queue = [];
         this.currentBlock = null;

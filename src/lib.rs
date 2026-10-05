@@ -86,6 +86,9 @@ impl Voice {
 pub struct WebAudioEngine {
     client: Option<ComputeClient<WgpuRuntime>>,
     fft_size: u32,
+    /// Aktuelle Audio-Samplerate (Hz) — vom AudioContext verhandelt, nicht
+    /// mehr fest 44100. Fließt in ADSR-Zeitbasis, LFO-Phase und Bin-Frequenzen.
+    sample_rate: Cell<f32>,
     last_cutoff: Cell<f32>,
     lfo_phase: Cell<f32>,
     block_count: Cell<u32>,
@@ -100,11 +103,27 @@ impl WebAudioEngine {
         Self {
             client: None,
             fft_size: 512, //2048
+            sample_rate: Cell::new(44100.0),
             last_cutoff: Cell::new(800.0),
             lfo_phase: Cell::new(0.0),
             block_count: Cell::new(0),
             voices: RefCell::new([Voice::new(); MAX_VOICES]),
         }
+    }
+
+    /// Samplerate des AudioContexts setzen — MUSS vor dem ersten
+    /// render_block_async (Warm-Up) aufgerufen werden, damit WGSL-Kompilierung,
+    /// ADSR-Zeitbasis, LFO-Phase und Bin-Frequenzen von Anfang an auf der
+    /// echten Rate (z.B. 48000 Hz) arbeiten. Kein Resampling mehr nötig.
+    pub fn set_sample_rate(&self, sample_rate: f32) {
+        if sample_rate > 0.0 {
+            self.sample_rate.set(sample_rate);
+        }
+    }
+
+    /// Aktuell konfigurierte Samplerate (Hz) — für Diagnose/UI.
+    pub fn get_sample_rate(&self) -> f32 {
+        self.sample_rate.get()
     }
 
     /// POLYPHONIE Note-On mit Voice-Allokation:
@@ -384,7 +403,7 @@ impl WebAudioEngine {
                 v.old_frequency,
                 cutoff,
                 old_cut,
-                44100.0,
+                self.sample_rate.get(),
                 current_lfo_phase,
                 arg_ratios,
                 arg_levels,
@@ -411,7 +430,7 @@ impl WebAudioEngine {
             handles_out.push(handle_out);
         }
 
-        let block_duration = (self.fft_size as f32) / 44100.0;
+        let block_duration = (self.fft_size as f32) / self.sample_rate.get();
         let next_lfo_phase =
             current_lfo_phase + (2.0 * std::f32::consts::PI * lfo_freq * block_duration);
         self.lfo_phase
@@ -439,7 +458,7 @@ impl WebAudioEngine {
                     if !v.gate_on {
                         let t_since_off = block_start_sample
                             .wrapping_sub(v.note_off_sample) as f32
-                            / 44100.0;
+                            / self.sample_rate.get();
                         if t_since_off > release * RELEASE_TAIL_FACTOR {
                             *v = Voice::new();
                         }

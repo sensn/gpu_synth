@@ -56,7 +56,8 @@ per-sample inverse DFT. There is no per-sample time-domain oscillator loop at al
 
 ### 3.1 Execution Model
 
-- **FFT size:** 2048 samples per block (~46.4 ms @ 44.1 kHz)
+- **FFT size:** 2048 samples per block (~46.4 ms @ 44.1 kHz, ~42.7 ms @ 48 kHz; the engine
+  currently runs `fft_size = 512` for lower latency — see §4)
 - **Grid:** `(fft_size + 255) / 256` workgroups × 256 threads (CubeDim 256×1×1); one thread per output sample `n`
 - **Per-thread work:** each thread computes one stereo frame by integrating `num_bins = 1025` frequency bins of the whole pipeline (an O(N²/2) direct IDFT — see §7 for discussion)
 
@@ -67,9 +68,9 @@ sample timeline (`global_sample = global_block_index·2048 + n`), fully continuo
 boundaries:
 
 ```
-global_sample = global_block_index·2048 + n
-t_since_on    = (global_sample − note_on_sample) / 44100
-t_since_off   = (global_sample − note_off_sample) / 44100
+global_sample = global_block_index·fft_size + n
+t_since_on    = (global_sample − note_on_sample) / sample_rate
+t_since_off   = (global_sample − note_off_sample) / sample_rate
 
 Gate open (note held):
   t < attack:            amp = t / attack                       (linear attack)
@@ -83,9 +84,12 @@ Gate closed (note released):
 
 base_freq:    old_freq + progress·(freq − old_freq)      ← block-boundary continuity
 base_cutoff:  old_cut + progress·(cutoff − old_cutoff)
-lfo_mod:      sin(lfo_phase + 2π·lfo_freq·n/44100)       ← phase accumulated on host across blocks
+lfo_mod:      sin(lfo_phase + 2π·lfo_freq·n/sample_rate) ← phase accumulated on host across blocks
 modulated_cutoff = clamp(base_cutoff + lfo_mod·lfo_depth, 50 Hz, ∞)
 ```
+
+`sample_rate` is a runtime kernel argument negotiated from the `AudioContext` (§4) — no
+hard-coded 44100 anywhere in the time base.
 
 Cross-block state (`old_frequency`, `old_cutoff`, `lfo_phase`, `global_block_index`, plus the note-event
 fields `gate_on`, `note_on_sample`, `note_off_sample`) is threaded through the kernel as runtime
@@ -96,7 +100,7 @@ runtime arguments do not include `bool`.
 
 ### 3.3 Spectral Synthesis: Sawtooth + FM Sidebands
 
-For each bin `k` (frequency `bin_freq = k·44100/2048`, bin width ≈ 21.5 Hz):
+For each bin `k` (frequency `bin_freq = k·sample_rate/fft_size`, e.g. ≈ 21.5 Hz width @ 44.1 kHz/2048):
 
 1. **Nearest-harmonic windowing** (performance-critical optimization): instead of iterating all 32
    sawtooth harmonics, the kernel computes `h_target = floor(bin_freq / base_freq)` and scans only
@@ -220,10 +224,12 @@ behavior is preserved while chords play polyphonically alongside it.
   list). This replaces the former `AudioBufferSourceNode` chain scheduling: no node
   garbage, sample-accurate timing, and gain changes apply instantly inside the audio
   thread instead of at block granularity.
-- **Resampling:** the kernel renders at a fixed 44.1 kHz; the worklet streams the FIFO
-  into the actual `AudioContext` sample rate with a linear streaming resampler whose
-  fractional position carries across block boundaries (no seam clicks at 48 kHz or other
-  context rates).
+- **Sample rate (no resampling):** the kernel renders **natively at the `AudioContext` sample
+  rate** — negotiated via `set_sample_rate(audioContext.sampleRate)` before the first
+  (warm-up) render, so WGSL compilation, the ADSR time base, LFO phase, and bin frequencies
+  all work on the real rate (e.g. 48 kHz) from the start. The worklet's linear streaming
+  resampler remains as a safety net with `ratio = 1.0` (passthrough) in case the rates ever
+  diverge.
 - **Underrun protection:** if the FIFO runs dry (GPU readback jitter, GC pause), the
   worklet outputs silence and fades back in over 5 ms when data returns — no hard clicks;
   an underrun counter is reported for debugging.
@@ -271,19 +277,20 @@ behavior is preserved while chords play polyphonically alongside it.
    ladder nonlinearity are not modeled.
 5. **Repo hygiene:** `src/` contains 8+ "Copy N" variant files and legacy modules (`synth.rs`,
    `reverb.rs`) that are dead code on this branch; `#![allow(warnings)]` suppresses diagnostics.
-6. **Hard-coded 44100 Hz** in three places (lib.rs ×2, index.html) — no sample-rate negotiation with
-   the AudioContext.
-7. **GPU rendering on the main thread:** the WASM/CubeCL engine renders on the main thread
+6. **GPU rendering on the main thread:** the WASM/CubeCL engine renders on the main thread
    (WebGPU + wasm-bindgen), so a blocked main thread can starve the worklet FIFO (mitigated by
    the ~3-block FIFO and underrun fade-out; a dedicated worker + its own GPU device would
    decouple it fully).
 
-> **Resolved in this revision:** the ADSR is no longer block-local, and the engine is no longer
-> monophonic. The envelope is a note-event-driven, absolute-time ADSR (§3.2) driven by a polyphonic
-> voice table (§4.1): per-voice gate/note-on/note-off state, one kernel launch per voice per block,
-> CPU equal-power mixing, voice stealing with release-tail recycling, and a dedicated drone voice.
-> Sustain/release controls and the piano/keyboard UI carry over; the legacy drone behavior is preserved
-> via the "Drone-Modus" toggle.
+> **Resolved in this revision:** the ADSR is no longer block-local, the engine is no longer
+> monophonic, and the sample rate is no longer hard-coded. The envelope is a note-event-driven,
+> absolute-time ADSR (§3.2) driven by a polyphonic voice table (§4.1): per-voice
+> gate/note-on/note-off state, one kernel launch per voice per block, CPU equal-power mixing,
+> voice stealing with release-tail recycling, and a dedicated drone voice. Scheduling runs on an
+> AudioWorklet with ack-driven flow control (§5), and the kernel renders natively at the
+> negotiated `AudioContext` sample rate — no resampling. Sustain/release controls and the
+> piano/keyboard UI carry over; the legacy drone behavior is preserved via the "Drone-Modus"
+> toggle.
 
 ---
 
