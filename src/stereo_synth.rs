@@ -154,36 +154,27 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
 
               // ... (Dein ADSR- und LFO-Setup bleibt unberührt) ...
 
+              // ... (Dein ADSR-, LFO- und Operator-Setup bleibt hierüber unberührt) ...
+
         let num_bins = fft_size / 2 + 1;
+        let global_sample_index = (F::cast_from(global_block_index) * samples_per_block) + F::cast_from(n);
 
-        let r1 = op_ratios[0];
-        let l1 = op_levels[0];
-        let r2 = op_ratios[1];
-        let l2 = op_levels[1];
-        let r3 = op_ratios[2];
-        let l3 = op_levels[2];
-        let r4 = op_ratios[3];
-        let l4 = op_levels[3];
-        let r5 = op_ratios[4];
-        let l5 = op_levels[4];
-        let r6 = op_ratios[5];
-        let l6 = op_levels[5];
-
-        // KORREKTUR: Absolute Zeitkomponente direkt aus der globalen Sample-Achse ableiten.
-        // Das garantiert Phasenstetigkeit bei Frequenzänderungen.
-        let current_global_time = global_sample / sample_rate;
+        // Die Zuweisungen für die 6 Operatoren
+        let r1 = op_ratios[0]; let l1 = op_levels[0];
+        let r2 = op_ratios[1]; let l2 = op_levels[1];
+        let r3 = op_ratios[2]; let l3 = op_levels[2];
+        let r4 = op_ratios[3]; let l4 = op_levels[3];
+        let r5 = op_ratios[4]; let l5 = op_levels[4];
+        let r6 = op_ratios[5]; let l6 = op_levels[5];
 
         for k in 0..num_bins {
             let k_f = F::cast_from(k);
             let bin_freq = (k_f * sample_rate) / samples_per_block;
             let bin_width = sample_rate / samples_per_block;
 
-            let mut real_spec = F::new(0.0);
-            let mut imag_spec = F::new(0.0);
-
             if k > 0 && bin_freq < sample_rate / F::new(2.0) {
                 
-                // 1. ORIGINAL DX7 FREQUENZ-KOPPLUNG
+                // 1. DX7 OSZILLATOR-FREQUENZEN
                 let f1 = base_freq * r1;
                 let f2 = base_freq * r2;
                 let f3 = base_freq * r3;
@@ -214,7 +205,7 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
                     base_amp = l1 * F::new(0.5);
                 }
 
-                // 2. STETIGE SPEKTRAL-PROXIMITY
+                // 2. KONTINUIERLICHE SEITENBAND-ANALYSE
                 let distance_to_carrier = F::abs(bin_freq - carrier_freq);
                 let exact_sideband_order = distance_to_carrier / F::max(F::new(1.0), mod_freq);
                 
@@ -228,159 +219,131 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
                 let dist_to_lower = F::abs(bin_freq - real_freq_lower);
                 let dist_to_upper = F::abs(bin_freq - real_freq_upper);
 
-                let mut total_amplitude = F::new(0.0);
-                let mut current_target_freq = F::new(0.0);
+                // --- HILFS-ZUFALLSGENERATOR FÜR REVERB-PHASEN HASHING ---
+                // Nutzt den aktuellen Index k_f als Seed, um deterministisches, stabiles Rauschen zu erzeugen
+                let rand_l_real = (F::sin(k_f * F::new(12.9898)) - F::floor(F::sin(k_f * F::new(12.9898)))) * F::new(2.0) - F::new(1.0);
+                let rand_l_imag = (F::cos(k_f * F::new(78.2330)) - F::floor(F::cos(k_f * F::new(78.2330)))) * F::new(2.0) - F::new(1.0);
+                let rand_r_real = (F::sin(k_f * F::new(45.1640)) - F::floor(F::sin(k_f * F::new(45.1640)))) * F::new(2.0) - F::new(1.0);
+                let rand_r_imag = (F::cos(k_f * F::new(92.7410)) - F::floor(F::cos(k_f * F::new(92.7410)))) * F::new(2.0) - F::new(1.0);
 
-                // --- BERECHNUNG UNTERES SEITENBAND ---
+                // --- PROZESSING: UNTERES SEITENBAND ---
                 if dist_to_lower < bin_width {
+                    // INTEGRATION BRICKWALL-FILTER: Arbeitet auf der präzisen Oszillator-Frequenz
                     let filter_gain = if real_freq_lower <= modulated_cutoff { F::new(1.0) } else { F::new(0.0) };
                     
                     if filter_gain > F::new(0.0) {
                         let bin_proximity_weight = F::new(1.0) - (dist_to_lower / bin_width);
                         let mut sideband_amp = base_amp / (F::new(1.0) + order_lower * order_lower);
-
                         if modulation_force > F::new(0.01) {
                             sideband_amp = sideband_amp * (F::new(1.0) + modulation_force * F::new(0.2));
                         } else if order_lower > F::new(0.5) { 
                             sideband_amp = F::new(0.0); 
                         }
+                        
+                        let filtered_synth_real = sideband_amp * bin_proximity_weight * filter_gain;
 
-                        total_amplitude = total_amplitude + (sideband_amp * bin_proximity_weight * filter_gain);
-                        current_target_freq = real_freq_lower;
+                        // INTEGRATION ALGORITHMISCHER HALL (Aus Beispiel 3)
+                        let freq_factor = F::new(1.0) + (real_freq_lower * high_freq_damping * F::new(0.0001));
+                        let effective_decay = room_size_seconds / freq_factor;
+                        let amplitude_decay = F::exp(-k_f / F::max(F::new(1.0), effective_decay * F::new(10.0)));
+
+                        let ir_l_real = rand_l_real * amplitude_decay;
+                        let ir_l_imag = rand_l_imag * amplitude_decay;
+                        let ir_r_real = rand_r_real * amplitude_decay;
+                        let ir_r_imag = rand_r_imag * amplitude_decay;
+
+                        let mid_real = (ir_l_real + ir_r_real) * F::new(0.5);
+                        let mid_imag = (ir_l_imag + ir_r_imag) * F::new(0.5);
+
+                        let final_l_real = mid_real + stereo_width * (ir_l_real - mid_real);
+                        let final_l_imag = mid_imag + stereo_width * (ir_l_imag - mid_imag);
+                        let final_r_real = mid_real + stereo_width * (ir_r_real - mid_real);
+                        let final_r_imag = mid_imag + stereo_width * (ir_r_imag - mid_imag);
+
+                        // Komplexe Faltung des Mono-Synthesizers mit der Stereo-Impulsantwort (Da synth_imag = 0)
+                        let wet_l_real = filtered_synth_real * final_l_real;
+                        let wet_l_imag = filtered_synth_real * final_l_imag;
+                        let wet_r_real = filtered_synth_real * final_r_real;
+                        let wet_r_imag = filtered_synth_real * final_r_imag;
+
+                        // Wet/Dry Mix Anwendung
+                        let res_l_real = (F::new(1.0) - wet_dry_mix) * filtered_synth_real + wet_dry_mix * wet_l_real;
+                        let res_l_imag = wet_dry_mix * wet_l_imag;
+                        let res_r_real = (F::new(1.0) - wet_dry_mix) * filtered_synth_real + wet_dry_mix * wet_r_real;
+                        let res_r_imag = wet_dry_mix * wet_r_imag;
+
+                        // KONTINUIERLICHE PITCH-IDFT ROTATION
+                        let exact_k_f = (real_freq_lower * samples_per_block) / sample_rate;
+                        let angle = (F::new(2.0) * pi * exact_k_f * global_sample_index) / samples_per_block;
+                        let cos_a = F::cos(angle);
+                        let sin_a = F::sin(angle);
+
+                        // Komplexe IDFT-Transformation zurück in den Zeitbereich
+                        final_sample_l += res_l_real * cos_a - res_l_imag * sin_a;
+                        final_sample_r += res_r_real * cos_a - res_r_imag * sin_a;
                     }
                 }
 
-                // --- BERECHNUNG OBERES SEITENBAND ---
+                // --- PROZESSING: OBERES SEITENBAND ---
                 if dist_to_upper < bin_width {
                     let filter_gain = if real_freq_upper <= modulated_cutoff { F::new(1.0) } else { F::new(0.0) };
                     
                     if filter_gain > F::new(0.0) {
                         let bin_proximity_weight = F::new(1.0) - (dist_to_upper / bin_width);
                         let mut sideband_amp = base_amp / (F::new(1.0) + order_upper * order_upper);
-
                         if modulation_force > F::new(0.01) {
                             sideband_amp = sideband_amp * (F::new(1.0) + modulation_force * F::new(0.2));
                         } else if order_upper > F::new(0.5) { 
                             sideband_amp = F::new(0.0); 
                         }
+                        
+                        let filtered_synth_real = sideband_amp * bin_proximity_weight * filter_gain;
 
-                        total_amplitude = total_amplitude + (sideband_amp * bin_proximity_weight * filter_gain);
-                        // Falls beide Bins treffen, gewichten wir die dominante Frequenz für die Phase
-                        if total_amplitude > F::new(0.0) && dist_to_upper < dist_to_lower {
-                            current_target_freq = real_freq_upper;
-                        } else if current_target_freq == F::new(0.0) {
-                            current_target_freq = real_freq_upper;
-                        }
-                    }
-                }
+                        // INTEGRATION ALGORITHMISCHER HALL
+                        let freq_factor = F::new(1.0) + (real_freq_upper * high_freq_damping * F::new(0.0001));
+                        let effective_decay = room_size_seconds / freq_factor;
+                        let amplitude_decay = F::exp(-k_f / F::max(F::new(1.0), effective_decay * F::new(10.0)));
 
-                // 3. ARTEFAKTFREIE PHASENINTERPOLATION
-                if total_amplitude > F::new(0.0) {
-                    // KORREKTUR PITCH & FILTER: 
-                    // Indem wir die Phase relativ zur Differenz zwischen Bin-Frequenz und Oszillator-Zielfrequenz modulieren,
-                    // gleitet die Energie klickfrei über das FFT-Gitter, wenn r1-r6 oder base_freq bewegt werden.
-                    // KORREKTUR: Wir entfernen bin_freq vollständig aus dem Phasenwinkel!
-                    // Die Phase läuft jetzt strikt auf der kontinuierlichen Oszillatorfrequenz.
-                 
-                  let phase_angle = F::new(2.0) * pi * current_target_freq * (global_sample / sample_rate);
-                    let bin_phase_offset = F::new(2.0) * pi * bin_freq * (global_sample / sample_rate);
-                    
-                    // Durch das synchrone Mitlaufen auf Basis von 'global_sample'
-                    // bleibt die Frequenzänderung exakt 1:1 am Slider gekoppelt.
-                    let final_angle = phase_angle - bin_phase_offset;
+                        let ir_l_real = rand_l_real * amplitude_decay;
+                        let ir_l_imag = rand_l_imag * amplitude_decay;
+                        let ir_r_real = rand_r_real * amplitude_decay;
+                        let ir_r_imag = rand_r_imag * amplitude_decay;
 
-                    real_spec = total_amplitude * F::cos(final_angle) * master_amp;
-                    imag_spec = total_amplitude * F::sin(final_angle) * master_amp;
-                 //noise3
-                 /*   let phase_angle = F::new(2.0) * pi * current_target_freq * current_global_time;
-                    let bin_phase_offset = F::new(2.0) * pi * bin_freq * current_global_time;
-                    let final_angle = phase_angle - bin_phase_offset;
+                        let mid_real = (ir_l_real + ir_r_real) * F::new(0.5);
+                        let mid_imag = (ir_l_imag + ir_r_imag) * F::new(0.5);
 
-                    real_spec = total_amplitude * F::cos(final_angle) * master_amp;
-                    imag_spec = total_amplitude * F::sin(final_angle) 
-                   */ 
-                    //NICE CHORUS
-          /*          let phase_angle = F::new(2.0) * pi * (bin_freq - current_target_freq) * current_global_time;
-                    
-                    real_spec = total_amplitude * F::cos(phase_angle) * master_amp;
-                    imag_spec = total_amplitude * F::sin(phase_angle) * master_amp;   */
-                }
-            }
+                        let final_l_real = mid_real + stereo_width * (ir_l_real - mid_real);
+                        let final_l_imag = mid_imag + stereo_width * (ir_l_imag - mid_imag);
+                        let final_r_real = mid_real + stereo_width * (ir_r_real - mid_real);
+                        let final_r_imag = mid_imag + stereo_width * (ir_r_imag - mid_imag);
 
-            // --- HIER FOLGT DEIN IDFT/PROZESSING-BLOCK ---
-            // z.B. final_sample_l += real_spec * cos_a + imag_spec * sin_a;
-        
-
-    // Falls dahinter der Code aus Beispiel 3 (Reverb / IDFT) folgt,
-    // überschreibe wet_l_real / wet_r_real NICHT mit den ungefilterten synth_real-Werten.
-    // Benutze direkt real_spec und imag_spec für die weiteren Faltungen!
-
-
-            // Parallel-Filterbank
-            let moog_gain: F = apply_moog_ladder::<F>(bin_freq, modulated_cutoff, moog_resonance);
-            let oberheim_gain: F = apply_oberheim_sem::<F>(
-                bin_freq,
-                modulated_cutoff,
-                oberheim_resonance,
-                oberheim_mode,
-            );
-
-            let combined_filter_gain = (moog_gain + oberheim_gain) * F::new(0.5);
-            let filtered_real = real_spec * combined_filter_gain;
-            let filtered_imag = imag_spec * combined_filter_gain;
-
-            // Prozeduraler Stereo-Hall
-            let freq_factor = F::new(1.0) + (bin_freq * high_freq_damping * F::new(0.0001));
-            let effective_decay = room_size_seconds / freq_factor;
-            let amplitude = F::exp(-k_f / F::max(F::new(1.0), effective_decay * F::new(10.0)));
-
-            let rand_l_real = (F::sin(k_f * F::new(12.9898))
-                - F::floor(F::sin(k_f * F::new(12.9898))))
-                * F::new(2.0)
-                - F::new(1.0);
-            let rand_l_imag = (F::cos(k_f * F::new(78.233))
-                - F::floor(F::cos(k_f * F::new(78.233))))
-                * F::new(2.0)
-                - F::new(1.0);
-            let rand_r_real = (F::sin(k_f * F::new(45.164))
-                - F::floor(F::sin(k_f * F::new(45.164))))
-                * F::new(2.0)
-                - F::new(1.0);
-            let rand_r_imag = (F::cos(k_f * F::new(92.741))
-                - F::floor(F::cos(k_f * F::new(92.741))))
-                * F::new(2.0)
-                - F::new(1.0);
-
-            let mid_real = (rand_l_real + rand_r_real) * F::new(0.25) * amplitude;
-            let mid_imag = (rand_l_imag + rand_r_imag) * F::new(0.25) * amplitude;
-            let diff_real = (rand_l_real - rand_r_real) * F::new(0.5) * amplitude;
-            let diff_imag = (rand_l_imag - rand_r_imag) * F::new(0.5) * amplitude;
-
-            let ir_l_real = mid_real + stereo_width * diff_real;
-            let ir_l_imag = mid_imag + stereo_width * diff_imag;
-            let ir_r_real = mid_real - stereo_width * diff_real;
-            let ir_r_imag = mid_imag - stereo_width * diff_imag;
-
-            let wet_l_real = filtered_real * ir_l_real - filtered_imag * ir_l_imag;
-            let wet_l_imag = filtered_real * ir_l_imag + filtered_imag * ir_l_real;
-            let wet_r_real = filtered_real * ir_r_real - filtered_imag * ir_r_imag;
-            let wet_r_imag = filtered_real * ir_r_imag + filtered_imag * ir_r_real;
-            let res_l_real = (F::new(1.0) - wet_dry_mix) * filtered_real + wet_dry_mix * wet_l_real;
-            let res_l_imag = (F::new(1.0) - wet_dry_mix) * filtered_imag + wet_dry_mix * wet_l_imag;
-            let res_r_real = (F::new(1.0) - wet_dry_mix) * filtered_real + wet_dry_mix * wet_r_real;
-            let res_r_imag = (F::new(1.0) - wet_dry_mix) * filtered_imag + wet_dry_mix * wet_r_imag; // PHASE FIX: Absolute, blockübergreifend fortlaufende Phasen-Akkumulation!// Das vernichtet das zyklische Block-Eiern vollständig.
-            let global_sample_index =
-                (F::cast_from(global_block_index) * samples_per_block) + F::cast_from(n);
-            let angle = (F::new(2.0) * pi * k_f * global_sample_index) / samples_per_block;
-            let cos_a = F::cos(angle);
-            let sin_a = F::sin(angle);
-            final_sample_l += res_l_real * cos_a + res_l_imag * sin_a;
-            final_sample_r += res_r_real * cos_a + res_r_imag * sin_a;
-        }
-        let scale = F::new(2.0) / samples_per_block;
-        let idx_l: usize = (n * 2) as usize;
-        let idx_r: usize = (n * 2 + 1) as usize;
-        output_stereo_audio[idx_l] = final_sample_l * scale * master_amp;
-        output_stereo_audio[idx_r] = final_sample_r * scale * master_amp;
-    }
+                        let wet_l_real = filtered_synth_real * final_l_real;
+                        let wet_l_imag = filtered_synth_real * final_l_imag;
+                        let wet_r_real = filtered_synth_real * final_r_real;
+let wet_r_imag = filtered_synth_real * final_r_imag;
+let res_l_real = (F::new(1.0) - wet_dry_mix) * filtered_synth_real + wet_dry_mix * wet_l_real;
+let res_l_imag = wet_dry_mix * wet_l_imag;
+let res_r_real = (F::new(1.0) - wet_dry_mix) * filtered_synth_real + wet_dry_mix * wet_r_real;
+let res_r_imag = wet_dry_mix * wet_r_imag;
+// KONTINUIERLICHE PITCH-IDFT ROTATION
+let exact_k_f = (real_freq_upper * samples_per_block) / sample_rate;
+let angle = (F::new(2.0) * pi * exact_k_f * global_sample_index) / samples_per_block;
+let cos_a = F::cos(angle);
+let sin_a = F::sin(angle);
+final_sample_l += res_l_real * cos_a - res_l_imag * sin_a;
+final_sample_r += res_r_real * cos_a - res_r_imag * sin_a;
+}
+}
+}
+}
+// ==========================================
+// FINALER STEREOPHACEN-AUSGABEBLOCK
+// ==========================================
+let scale = F::new(2.0) / samples_per_block;
+let idx_l: usize = (n * 2) as usize;
+let idx_r: usize = (n * 2 + 1) as usize;
+// Die Hüllkurve (master_amp) steuert sauber das Gesamtsignal inklusive des Hall-Ausklangs
+output_stereo_audio[idx_l] = final_sample_l * scale * master_amp;
+output_stereo_audio[idx_r] = final_sample_r * scale * master_amp;
+}
 }
