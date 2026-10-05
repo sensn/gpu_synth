@@ -279,10 +279,24 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
                     // KORREKTUR PITCH & FILTER: 
                     // Indem wir die Phase relativ zur Differenz zwischen Bin-Frequenz und Oszillator-Zielfrequenz modulieren,
                     // gleitet die Energie klickfrei über das FFT-Gitter, wenn r1-r6 oder base_freq bewegt werden.
-                    let phase_angle = F::new(2.0) * pi * (bin_freq - current_target_freq) * current_global_time;
+                    // KORREKTUR: Wir entfernen bin_freq vollständig aus dem Phasenwinkel!
+                    // Die Phase läuft jetzt strikt auf der kontinuierlichen Oszillatorfrequenz.
+                    let phase_angle = F::new(2.0) * pi * current_target_freq * current_global_time;
+                    
+                    // Um dem IDFT-Block (der mit cos_a/sin_a arbeitet) mitzuteilen, wo das Signal im
+                    // FFT-Gitter liegt, kompensieren wir die Phasenlage relativ zur Bin-Mitte.
+                    // Das verhindert Phasenlöschungen beim Rendern des finalen Samples.
+                    let bin_phase_offset = F::new(2.0) * pi * bin_freq * current_global_time;
+                    let final_angle = phase_angle - bin_phase_offset;
+
+                    real_spec = total_amplitude * F::cos(final_angle) * master_amp;
+                    imag_spec = total_amplitude * F::sin(final_angle) 
+                    
+                    //NICE CHORUS
+          /*          let phase_angle = F::new(2.0) * pi * (bin_freq - current_target_freq) * current_global_time;
                     
                     real_spec = total_amplitude * F::cos(phase_angle) * master_amp;
-                    imag_spec = total_amplitude * F::sin(phase_angle) * master_amp;
+                    imag_spec = total_amplitude * F::sin(phase_angle) * master_amp;   */
                 }
             }
 
