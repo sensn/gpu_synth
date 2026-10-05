@@ -163,11 +163,10 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
         let local_sample_n = F::cast_from(n);
         let block_progress = local_sample_n / samples_per_block_f;
 
-        // Kontinuierliche Frequenz- und Cutoff-Interpolation pro Sample
+        // 1. FREQUENZ-INTERPOLATION PRO SAMPLE
         let current_base_freq = old_frequency + (block_progress * (frequency - old_frequency));
         let current_modulated_cutoff = old_cutoff + (block_progress * (dyn_cutoff - old_cutoff));
 
-        // --- CUBECL FIX: Explizites Auslesen der Array-Indizes als Skalare vom Typ F ---
         let r1 = op_ratios[0]; let l1 = op_levels[0];
         let r2 = op_ratios[1]; let l2 = op_levels[1];
         let r3 = op_ratios[2]; let l3 = op_levels[2];
@@ -175,7 +174,7 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
         let r5 = op_ratios[4]; let l5 = op_levels[4];
         let r6 = op_ratios[5]; let l6 = op_levels[5];
 
-        // 1. DX7 CORE FREQUENZ-BERECHNUNG (Jetzt mathematisch korrekt mit Skalaren)
+        // --- SCHRITT A: AKTUELLER BLOCK (MOMENTANFREQUENZEN) ---
         let f1 = current_base_freq * r1;
         let f2 = current_base_freq * r2;
         let f3 = current_base_freq * r3;
@@ -194,8 +193,6 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
         if algo_select == 0 {
             let op3_mod = l3 * F::max(F::new(0.1), r3);
             let op4_mod = l4 * F::max(F::new(0.1), r4);
-            
-            // Rechnet nun stabil mit dem echten Typen F
             carrier_freq = (f1 * l1 + f2 * l2) / F::max(F::new(0.05), l1 + l2);
             mod_freq = (f3 * l3 + f4 * l4 + f5 * l5 + f6_effective * l6) / F::max(F::new(0.1), l3 + l4 + l5 + l6);
             modulation_force = op3_mod + op4_mod;
@@ -208,13 +205,33 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
             base_amp = l1 * F::new(0.5);
         }
 
+        // --- KORREKTUR SCHRITT B: VORHERIGER BLOCK (HISTORISCHE ANKER-FREQUENZEN) ---
+        // Wir rekonstruieren die exakte FM-Struktur des letzten Blocks, um den Phasenübergang zu glätten!
+        let old_f1 = old_frequency * r1;
+        let old_f2 = old_frequency * r2;
+        let old_f3 = old_frequency * r3;
+        let old_f4 = old_frequency * r4;
+        let old_f5 = old_frequency * r5;
+        let old_f6 = old_frequency * r6;
+        
+        let mut old_carrier_freq = old_frequency;
+        let mut old_mod_freq = old_frequency;
+        let old_f6_effective = old_f6 + (l6 * l6 * F::max(F::new(0.1), r6) * F::new(0.5));
+
+        if algo_select == 0 {
+            old_carrier_freq = (old_f1 * l1 + old_f2 * l2) / F::max(F::new(0.05), l1 + l2);
+            old_mod_freq = (old_f3 * l3 + old_f4 * l4 + old_f5 * l5 + old_f6_effective * l6) / F::max(F::new(0.1), l3 + l4 + l5 + l6);
+        } else {
+            old_carrier_freq = old_f1;
+            old_mod_freq = old_f2;
+        }
+
         // 2. DIREKTE GENERIERUNG DER SEITENBÄNDER
         let max_sidebands = 16; 
 
         for sideband in 0..max_sidebands {
             let order = F::cast_from(sideband);
             
-            // Berechne Amplitudenabfall der Ordnung
             let mut sideband_amp = base_amp / (F::new(1.0) + order * order);
             if modulation_force > F::new(0.01) {
                 sideband_amp = sideband_amp * (F::new(1.0) + modulation_force * F::new(0.2));
@@ -227,6 +244,8 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
                     if !(sideband == 0 && sign_idx == 1) { 
                         
                         let sign = if sign_idx == 0 { F::new(-1.0) } else { F::new(1.0) };
+                        
+                        // Aktuelle Frequenz für den lokalen Blockteil
                         let real_freq = carrier_freq + (sign * order * mod_freq);
 
                         if real_freq > F::new(10.0) && real_freq < sample_rate / F::new(2.0) {
@@ -236,7 +255,7 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
                             if filter_gain > F::new(0.0) {
                                 let filtered_synth_real = sideband_amp * filter_gain;
 
-                                // REVERB SEEDING
+                                // REVERB SEEDING & PROCESSING
                                 let rand_l_real = (F::sin(order * F::new(12.9898)) - F::floor(F::sin(order * F::new(12.9898)))) * F::new(2.0) - F::new(1.0);
                                 let rand_l_imag = (F::cos(order * F::new(78.2330)) - F::floor(F::cos(order * F::new(78.2330)))) * F::new(2.0) - F::new(1.0);
                                 let rand_r_real = (F::sin(order * F::new(45.1640)) - F::floor(F::sin(order * F::new(45.1640)))) * F::new(2.0) - F::new(1.0);
@@ -261,10 +280,15 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
                                 let res_r_real = (F::new(1.0) - wet_dry_mix) * filtered_synth_real + wet_dry_mix * wet_r_real;
                                 let res_r_imag = wet_dry_mix * wet_r_imag;
 
-                                // ABSOLUTE, BLOCKÜBERGREIFEND LÜCKENLOSE PHASEN-ROTATION
-                                let exact_k_f = (real_freq * samples_per_block_f) / sample_rate;
-                                let base_exact_k_f = (old_frequency * samples_per_block_f) / sample_rate;
+                                // --- KORREKTUR: SEITENBAND-SPEZIFISCHE PHASEN-STETIGKEIT ---
+                                // 1. Berechne die exakte historische Frequenz, die DIESES Seitenband im letzten Block hatte!
+                                let old_real_freq = old_carrier_freq + (sign * order * old_mod_freq);
                                 
+                                // 2. Wandle beide Frequenzen in präzise IDFT-Phasenschritte um
+                                let exact_k_f = (real_freq * samples_per_block_f) / sample_rate;
+                                let base_exact_k_f = (old_real_freq * samples_per_block_f) / sample_rate;
+                                
+                                // 3. Zusammenfügen: Der historische Anker nutzt nun das exakt passende Vorblock-Seitenband
                                 let phase_history = (F::new(2.0) * pi * base_exact_k_f * block_start_sample) / samples_per_block_f;
                                 let phase_local = (F::new(2.0) * pi * exact_k_f * local_sample_n) / samples_per_block_f;
                                 
@@ -280,7 +304,7 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
             }
         }
 
-        // 3. ABSOLUT SICHERES INTEGRAL-GAIN-STAGING & LIMITER
+        // 3. SICHERES GAIN-STAGING & LIMITER
         let scale = F::new(0.05); 
         let idx_l: usize = (n * 2) as usize;
         let idx_r: usize = (n * 2 + 1) as usize;
