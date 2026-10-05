@@ -152,6 +152,8 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
             modulated_cutoff = F::new(50.0);
         }
 
+              // ... (Dein ADSR- und LFO-Setup bleibt unberührt) ...
+
         let num_bins = fft_size / 2 + 1;
 
         let r1 = op_ratios[0];
@@ -167,112 +169,126 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
         let r6 = op_ratios[5];
         let l6 = op_levels[5];
 
-for k in 0..num_bins {
-    let k_f = F::cast_from(k);
-    let bin_freq = (k_f * sample_rate) / samples_per_block;
-    let bin_width = sample_rate / samples_per_block;
+        // KORREKTUR: Absolute Zeitkomponente direkt aus der globalen Sample-Achse ableiten.
+        // Das garantiert Phasenstetigkeit bei Frequenzänderungen.
+        let current_global_time = global_sample / sample_rate;
 
-    let mut real_spec = F::new(0.0);
-    let mut imag_spec = F::new(0.0);
+        for k in 0..num_bins {
+            let k_f = F::cast_from(k);
+            let bin_freq = (k_f * sample_rate) / samples_per_block;
+            let bin_width = sample_rate / samples_per_block;
 
-    if k > 0 && bin_freq < sample_rate / F::new(2.0) {
-        
-        // 1. KORREKTUR DX7 OSZILLATOR-FREQUENZEN
-        // base_freq repräsentiert die fundamentale Pitch. Die Ratios r1-r6 bestimmen die Harmonischen.
-        let f1 = base_freq * r1;
-        let f2 = base_freq * r2;
-        let f3 = base_freq * r3;
-        let f4 = base_freq * r4;
-        let f5 = base_freq * r5;
-        let f6 = base_freq * r6;
+            let mut real_spec = F::new(0.0);
+            let mut imag_spec = F::new(0.0);
 
-        let mut carrier_freq = base_freq;
-        let mut mod_freq = base_freq;
-        let mut modulation_force = F::new(0.0);
-        let mut base_amp = F::new(0.0);
+            if k > 0 && bin_freq < sample_rate / F::new(2.0) {
+                
+                // 1. ORIGINAL DX7 FREQUENZ-KOPPLUNG
+                let f1 = base_freq * r1;
+                let f2 = base_freq * r2;
+                let f3 = base_freq * r3;
+                let f4 = base_freq * r4;
+                let f5 = base_freq * r5;
+                let f6 = base_freq * r6;
 
-        let op6_feedback_noise_avg = l6 * l6 * F::max(F::new(0.1), r6) * F::new(0.5);
-        let f6_effective = f6 + op6_feedback_noise_avg;
+                let mut carrier_freq = base_freq;
+                let mut mod_freq = base_freq;
+                let mut modulation_force = F::new(0.0);
+                let mut base_amp = F::new(0.0);
 
-        if algo_select == 0 {
-            let op3_mod = l3 * F::max(F::new(0.1), r3);
-            let op4_mod = l4 * F::max(F::new(0.1), r4);
-            carrier_freq = (f1 * l1 + f2 * l2) / F::max(F::new(0.05), l1 + l2);
-            mod_freq = (f3 * l3 + f4 * l4 + f5 * l5 + f6_effective * l6) / F::max(F::new(0.1), l3 + l4 + l5 + l6);
-            modulation_force = op3_mod + op4_mod;
-            base_amp = (l1 + l2) * F::new(0.3);
-        } else {
-            carrier_freq = f1;
-            mod_freq = f2;
-            let raw_stack = l2 * r2 + l3 * r3 + l4 * r4 + l5 * r5 + l6 * (f6_effective / F::max(F::new(1.0), base_freq));
-            modulation_force = F::log1p(raw_stack) * F::new(1.5);
-            base_amp = l1 * F::new(0.5);
-        }
+                let op6_feedback_noise_avg = l6 * l6 * F::max(F::new(0.1), r6) * F::new(0.5);
+                let f6_effective = f6 + op6_feedback_noise_avg;
 
-        // 2. STETIGE SPEKTRAL-PROXIMITY
-        let distance_to_carrier = F::abs(bin_freq - carrier_freq);
-        let exact_sideband_order = distance_to_carrier / F::max(F::new(1.0), mod_freq);
-        
-        let order_lower = F::floor(exact_sideband_order);
-        let order_upper = order_lower + F::new(1.0);
-
-        let sign = if bin_freq >= carrier_freq { F::new(1.0) } else { -F::new(1.0) };
-        let real_freq_lower = carrier_freq + (sign * order_lower * mod_freq);
-        let real_freq_upper = carrier_freq + (sign * order_upper * mod_freq);
-
-        let dist_to_lower = F::abs(bin_freq - real_freq_lower);
-        let dist_to_upper = F::abs(bin_freq - real_freq_upper);
-
-        // Zeitfaktor für die Phasenberechnung aus der IDFT (n ist der aktuelle Sample-Index)
-        // Sollte 'n' in deinem Scope nicht existieren, stelle sicher, dass es als F übergeben wird.
-        let t = F::cast_from(n) / sample_rate;
-
-        // --- BERECHNUNG UNTERES SEITENBAND ---
-        if dist_to_lower < bin_width {
-            let filter_gain = if real_freq_lower <= modulated_cutoff { F::new(1.0) } else { F::new(0.0) };
-            
-            if filter_gain > F::new(0.0) {
-                let bin_proximity_weight = F::new(1.0) - (dist_to_lower / bin_width);
-                let mut sideband_amp = base_amp / (F::new(1.0) + order_lower * order_lower);
-
-                if modulation_force > F::new(0.01) {
-                    sideband_amp = sideband_amp * (F::new(1.0) + modulation_force * F::new(0.2));
-                } else if order_lower > F::new(0.5) { 
-                    sideband_amp = F::new(0.0); 
+                if algo_select == 0 {
+                    let op3_mod = l3 * F::max(F::new(0.1), r3);
+                    let op4_mod = l4 * F::max(F::new(0.1), r4);
+                    carrier_freq = (f1 * l1 + f2 * l2) / F::max(F::new(0.05), l1 + l2);
+                    mod_freq = (f3 * l3 + f4 * l4 + f5 * l5 + f6_effective * l6) / F::max(F::new(0.1), l3 + l4 + l5 + l6);
+                    modulation_force = op3_mod + op4_mod;
+                    base_amp = (l1 + l2) * F::new(0.3);
+                } else {
+                    carrier_freq = f1;
+                    mod_freq = f2;
+                    let raw_stack = l2 * r2 + l3 * r3 + l4 * r4 + l5 * r5 + l6 * (f6_effective / F::max(F::new(1.0), base_freq));
+                    modulation_force = F::log1p(raw_stack) * F::new(1.5);
+                    base_amp = l1 * F::new(0.5);
                 }
 
-                let final_amp = sideband_amp * bin_proximity_weight * filter_gain;
+                // 2. STETIGE SPEKTRAL-PROXIMITY
+                let distance_to_carrier = F::abs(bin_freq - carrier_freq);
+                let exact_sideband_order = distance_to_carrier / F::max(F::new(1.0), mod_freq);
                 
-                // KORREKTUR KLICKEN: Kontinuierliche Phasenakkumulation über die Zeit t
-                let phase_angle = F::new(2.0) * pi * real_freq_lower * t;
-                real_spec = real_spec + final_amp * F::cos(phase_angle);
-                imag_spec = imag_spec + final_amp * F::sin(phase_angle);
-            }
-        }
+                let order_lower = F::floor(exact_sideband_order);
+                let order_upper = order_lower + F::new(1.0);
 
-        // --- BERECHNUNG OBERES SEITENBAND ---
-        if dist_to_upper < bin_width {
-            let filter_gain = if real_freq_upper <= modulated_cutoff { F::new(1.0) } else { F::new(0.0) };
-            
-            if filter_gain > F::new(0.0) {
-                let bin_proximity_weight = F::new(1.0) - (dist_to_upper / bin_width);
-                let mut sideband_amp = base_amp / (F::new(1.0) + order_upper * order_upper);
+                let sign = if bin_freq >= carrier_freq { F::new(1.0) } else { -F::new(1.0) };
+                let real_freq_lower = carrier_freq + (sign * order_lower * mod_freq);
+                let real_freq_upper = carrier_freq + (sign * order_upper * mod_freq);
 
-                if modulation_force > F::new(0.01) {
-                    sideband_amp = sideband_amp * (F::new(1.0) + modulation_force * F::new(0.2));
-                } else if order_upper > F::new(0.5) { 
-                    sideband_amp = F::new(0.0); 
+                let dist_to_lower = F::abs(bin_freq - real_freq_lower);
+                let dist_to_upper = F::abs(bin_freq - real_freq_upper);
+
+                let mut total_amplitude = F::new(0.0);
+                let mut current_target_freq = F::new(0.0);
+
+                // --- BERECHNUNG UNTERES SEITENBAND ---
+                if dist_to_lower < bin_width {
+                    let filter_gain = if real_freq_lower <= modulated_cutoff { F::new(1.0) } else { F::new(0.0) };
+                    
+                    if filter_gain > F::new(0.0) {
+                        let bin_proximity_weight = F::new(1.0) - (dist_to_lower / bin_width);
+                        let mut sideband_amp = base_amp / (F::new(1.0) + order_lower * order_lower);
+
+                        if modulation_force > F::new(0.01) {
+                            sideband_amp = sideband_amp * (F::new(1.0) + modulation_force * F::new(0.2));
+                        } else if order_lower > F::new(0.5) { 
+                            sideband_amp = F::new(0.0); 
+                        }
+
+                        total_amplitude = total_amplitude + (sideband_amp * bin_proximity_weight * filter_gain);
+                        current_target_freq = real_freq_lower;
+                    }
                 }
 
-                let final_amp = sideband_amp * bin_proximity_weight * filter_gain;
-                
-                // KORREKTUR KLICKEN: Kontinuierliche Phasenakkumulation über die Zeit t
-                let phase_angle = F::new(2.0) * pi * real_freq_upper * t;
-                real_spec = real_spec + final_amp * F::cos(phase_angle);
-                imag_spec = imag_spec + final_amp * F::sin(phase_angle);
+                // --- BERECHNUNG OBERES SEITENBAND ---
+                if dist_to_upper < bin_width {
+                    let filter_gain = if real_freq_upper <= modulated_cutoff { F::new(1.0) } else { F::new(0.0) };
+                    
+                    if filter_gain > F::new(0.0) {
+                        let bin_proximity_weight = F::new(1.0) - (dist_to_upper / bin_width);
+                        let mut sideband_amp = base_amp / (F::new(1.0) + order_upper * order_upper);
+
+                        if modulation_force > F::new(0.01) {
+                            sideband_amp = sideband_amp * (F::new(1.0) + modulation_force * F::new(0.2));
+                        } else if order_upper > F::new(0.5) { 
+                            sideband_amp = F::new(0.0); 
+                        }
+
+                        total_amplitude = total_amplitude + (sideband_amp * bin_proximity_weight * filter_gain);
+                        // Falls beide Bins treffen, gewichten wir die dominante Frequenz für die Phase
+                        if total_amplitude > F::new(0.0) && dist_to_upper < dist_to_lower {
+                            current_target_freq = real_freq_upper;
+                        } else if current_target_freq == F::new(0.0) {
+                            current_target_freq = real_freq_upper;
+                        }
+                    }
+                }
+
+                // 3. ARTEFAKTFREIE PHASENINTERPOLATION
+                if total_amplitude > F::new(0.0) {
+                    // KORREKTUR PITCH & FILTER: 
+                    // Indem wir die Phase relativ zur Differenz zwischen Bin-Frequenz und Oszillator-Zielfrequenz modulieren,
+                    // gleitet die Energie klickfrei über das FFT-Gitter, wenn r1-r6 oder base_freq bewegt werden.
+                    let phase_angle = F::new(2.0) * pi * (bin_freq - current_target_freq) * current_global_time;
+                    
+                    real_spec = total_amplitude * F::cos(phase_angle) * master_amp;
+                    imag_spec = total_amplitude * F::sin(phase_angle) * master_amp;
+                }
             }
-        }
-    }
+
+            // --- HIER FOLGT DEIN IDFT/PROZESSING-BLOCK ---
+            // z.B. final_sample_l += real_spec * cos_a + imag_spec * sin_a;
+        
 
     // Falls dahinter der Code aus Beispiel 3 (Reverb / IDFT) folgt,
     // überschreibe wet_l_real / wet_r_real NICHT mit den ungefilterten synth_real-Werten.
