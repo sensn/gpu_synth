@@ -167,79 +167,102 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
         let r6 = op_ratios[5];
         let l6 = op_levels[5];
 
-    for k in 0..num_bins {
+for k in 0..num_bins {
     let k_f = F::cast_from(k);
     let bin_freq = (k_f * sample_rate) / samples_per_block;
+    let bin_width = sample_rate / samples_per_block;
 
     let mut real_spec = F::new(0.0);
     let mut imag_spec = F::new(0.0);
 
     if k > 0 && bin_freq < sample_rate / F::new(2.0) {
         
-        // 1. STRUKTURELLER SETUP AUS BEISPIEL 2 (Frequenzen & Modulationskräfte berechnen)
+        // 1. DX7 OSZILLATOR-FREQUENZEN
+        let f1 = base_freq * r1;
+        let f2 = base_freq * r2;
+        let f3 = base_freq * r3;
+        let f4 = base_freq * r4;
+        let f5 = base_freq * r5;
+        let f6 = base_freq * r6;
+
         let mut carrier_freq = base_freq;
         let mut mod_freq = base_freq;
         let mut modulation_force = F::new(0.0);
         let mut base_amp = F::new(0.0);
 
-        // Näherung des Operator-6-Selbstfeedbacks (Vermeidet unendliche s_f Abhängigkeit beim Frequenz-Targeting)
-        let op6_feedback_noise_avg = l6 * l6 * F::max(F::new(0.1), r6) * F::new(0.5);
-        let effective_r6_ratio = r6 + op6_feedback_noise_avg;
+        let op6_feedback_noise_avg = l6 * l6 * F::max(F::new(0.1), f6) * F::new(0.5);
+        let f6_effective = f6 + op6_feedback_noise_avg;
 
         if algo_select == 0 {
-            // Algorithmus 0: Parallele Träger (Op1 + Op2), moduliert durch Stack (Op3 + Op4 + Op5 + Op6)
-            let c1 = base_freq * r1;
-            let c2 = base_freq * r2;
             let op3_mod = l3 * F::max(F::new(0.1), r3);
             let op4_mod = l4 * F::max(F::new(0.1), r4);
-            
-            carrier_freq = (c1 * l1 + c2 * l2) / F::max(F::new(0.05), l1 + l2);
-            mod_freq = base_freq * (r3 * l3 + r4 * l4 + r5 * l5 + effective_r6_ratio * l6) / F::max(F::new(0.1), l3 + l4 + l5 + l6);
+            carrier_freq = (f1 * l1 + f2 * l2) / F::max(F::new(0.05), l1 + l2);
+            mod_freq = (f3 * l3 + f4 * l4 + f5 * l5 + f6_effective * l6) / F::max(F::new(0.1), l3 + l4 + l5 + l6);
             modulation_force = op3_mod + op4_mod;
             base_amp = (l1 + l2) * F::new(0.3);
         } else {
-            // Algorithmus 1: Vertikaler 6-Operator-Turm (Kaskade)
-            carrier_freq = base_freq * r1;
-            mod_freq = base_freq * r2;
-            
-            let raw_stack = l2 * r2 + l3 * r3 + l4 * r4 + l5 * r5 + l6 * effective_r6_ratio;
+            carrier_freq = f1;
+            mod_freq = f2;
+            let raw_stack = l2 * r2 + l3 * r3 + l4 * r4 + l5 * r5 + l6 * (f6_effective / base_freq);
             modulation_force = F::log1p(raw_stack) * F::new(1.5);
             base_amp = l1 * F::new(0.5);
         }
 
-        // 2. FENSTERBASIERTE FM-GENERIERUNG AUS BEISPIEL 4 (O(1) statt 47er-Schleife)
-        // Wir berechnen den Abstand des Bins zum Träger
+        // 2. KONTINUIERLICHE SEITENBAND-ANALYSE
         let distance_to_carrier = F::abs(bin_freq - carrier_freq);
+        let exact_sideband_order = distance_to_carrier / F::max(F::new(1.0), mod_freq);
         
-        // Bestimme den exakten harmonischen Schritt (die Seitenband-Ordnung)
-        let harmonic_step = distance_to_carrier / F::max(F::new(1.0), mod_freq);
-        let fract = harmonic_step - F::floor(harmonic_step);
-        
-        // Prüfe über die Fang-Zone (±0.15), ob das aktuelle Bin eine FM-Komponente trifft
-        if fract < F::new(0.15) || fract > F::new(0.85) {
-            let order = F::floor(harmonic_step);
-            
-            // Quadratischer Amplituden-Abfall aus Beispiel 4, skaliert durch 6-Op Modulation & Basis-Lautstärke
-            let mut sideband_amplitude = base_amp / (F::new(1.0) + order * order);
-            
-            // Dynamische Skalierung der Seitenbänder durch die Modulationskraft der Operatoren
+        let order_lower = F::floor(exact_sideband_order);
+        let order_upper = order_lower + F::new(1.0);
+
+        let sign = if bin_freq >= carrier_freq { F::new(1.0) } else { -F::new(1.0) };
+        let real_freq_lower = carrier_freq + (sign * order_lower * mod_freq);
+        let real_freq_upper = carrier_freq + (sign * order_upper * mod_freq);
+
+        // 3. GLATTE INTERPOLATION (Sequentiell ohne Arrays gelöst)
+        let dist_to_lower = F::abs(bin_freq - real_freq_lower);
+        let dist_to_upper = F::abs(bin_freq - real_freq_upper);
+
+        let mut total_amplitude = F::new(0.0);
+
+        // --- BERECHNUNG UNTERES SEITENBAND ---
+        if dist_to_lower < bin_width {
+            let bin_proximity_weight = F::new(1.0) - (dist_to_lower / bin_width);
+            let mut sideband_amp = base_amp / (F::new(1.0) + order_lower * order_lower);
+
             if modulation_force > F::new(0.01) {
-                sideband_amplitude = sideband_amplitude * (F::new(1.0) + modulation_force * F::new(0.2));
+                sideband_amp = sideband_amp * (F::new(1.0) + modulation_force * F::new(0.2));
             } else {
-                // Ohne Modulationskraft existiert nur das Hauptsignal (Träger/erste Ordnung)
-                if order > F::new(1.0) {
-                    sideband_amplitude = F::new(0.0);
+                if order_lower > F::new(0.5) { 
+                    sideband_amp = F::new(0.0); 
                 }
             }
-            
-            // Phasen-Paritäts-Zuweisung
-            if k % 2 == 0 {
-                real_spec = sideband_amplitude;
+            total_amplitude = total_amplitude + (sideband_amp * bin_proximity_weight);
+        }
+
+        // --- BERECHNUNG OBERES SEITENBAND ---
+        if dist_to_upper < bin_width {
+            let bin_proximity_weight = F::new(1.0) - (dist_to_upper / bin_width);
+            let mut sideband_amp = base_amp / (F::new(1.0) + order_upper * order_upper);
+
+            if modulation_force > F::new(0.01) {
+                sideband_amp = sideband_amp * (F::new(1.0) + modulation_force * F::new(0.2));
             } else {
-                imag_spec = sideband_amplitude;
+                if order_upper > F::new(0.5) { 
+                    sideband_amp = F::new(0.0); 
+                }
             }
+            total_amplitude = total_amplitude + (sideband_amp * bin_proximity_weight);
+        }
+
+        // 4. PHASEN-ZUWEISUNG
+        if k % 2 == 0 {
+            real_spec = total_amplitude;
+        } else {
+            imag_spec = total_amplitude;
         }
     }
+
 
             // Parallel-Filterbank
             let moog_gain: F = apply_moog_ladder::<F>(bin_freq, modulated_cutoff, moog_resonance);
