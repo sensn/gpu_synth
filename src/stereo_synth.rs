@@ -152,16 +152,22 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
             modulated_cutoff = F::new(50.0);
         }
 
-            // ... (Dein ADSR- und Operator-Setup bleibt absolut identisch) ...
+           // ... (Dein ADSR- und Operator-Setup bleibt identisch) ...
 
-        let num_bins = fft_size / 2 + 1;
-        
-        // KORREKTUR: Wir spalten die Zeitachse auf, um Phasenbrüche an Blockgrenzen zu verhindern!
+            // ... (Dein ADSR- und LFO-Setup bleibt absolut unberührt) ...
+
+    let num_bins = fft_size / 2 + 1;
         let samples_per_block_f = samples_per_block;
+        
         let block_start_sample = F::cast_from(global_block_index) * samples_per_block_f;
         let local_sample_n = F::cast_from(n);
+        let block_progress = local_sample_n / samples_per_block_f;
 
-        // Die Zuweisungen für die 6 Operatoren
+        // Kontinuierliche Frequenz- und Cutoff-Interpolation pro Sample
+        let current_base_freq = old_frequency + (block_progress * (frequency - old_frequency));
+        let current_modulated_cutoff = old_cutoff + (block_progress * (dyn_cutoff - old_cutoff));
+
+        // Zuweisungen für die 6 Operatoren
         let r1 = op_ratios[0]; let l1 = op_levels[0];
         let r2 = op_ratios[1]; let l2 = op_levels[1];
         let r3 = op_ratios[2]; let l3 = op_levels[2];
@@ -169,166 +175,120 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
         let r5 = op_ratios[4]; let l5 = op_levels[4];
         let r6 = op_ratios[5]; let l6 = op_levels[5];
 
-        for k in 0..num_bins {
-            let k_f = F::cast_from(k);
-            let bin_freq = (k_f * sample_rate) / samples_per_block_f;
-            let bin_width = sample_rate / samples_per_block_f;
+        // 1. DX7 CORE FREQUENZ-BERECHNUNG
+        let f1 = current_base_freq * r1;
+        let f2 = current_base_freq * r2;
+        let f3 = current_base_freq * r3;
+        let f4 = current_base_freq * r4;
+        let f5 = current_base_freq * r5;
+        let f6 = current_base_freq * r6;
 
-            if k > 0 && bin_freq < sample_rate / F::new(2.0) {
-                
-                // 1. DYNAMISCHE DX7 OSZILLATOR-FREQUENZEN (Mit Slider-Glättungs-Interpolation)
-                let f1 = base_freq * r1;
-                let f2 = base_freq * r2;
-                let f3 = base_freq * r3;
-                let f4 = base_freq * r4;
-                let f5 = base_freq * r5;
-                let f6 = base_freq * r6;
+        let mut carrier_freq = current_base_freq;
+        let mut mod_freq = current_base_freq;
+        let mut modulation_force = F::new(0.0);
+        let mut base_amp = F::new(0.0);
 
-                let mut carrier_freq = base_freq;
-                let mut mod_freq = base_freq;
-                let mut modulation_force = F::new(0.0);
-                let mut base_amp = F::new(0.0);
+        let op6_feedback_noise_avg = l6 * l6 * F::max(F::new(0.1), r6) * F::new(0.5);
+        let f6_effective = f6 + op6_feedback_noise_avg;
 
-                let op6_feedback_noise_avg = l6 * l6 * F::max(F::new(0.1), r6) * F::new(0.5);
-                let f6_effective = f6 + op6_feedback_noise_avg;
+        if algo_select == 0 {
+            let op3_mod = l3 * F::max(F::new(0.1), r3);
+            let op4_mod = l4 * F::max(F::new(0.1), r4);
+            carrier_freq = (f1 * l1 + f2 * l2) / F::max(F::new(0.05), l1 + l2);
+            mod_freq = (f3 * l3 + f4 * l4 + f5 * l5 + f6_effective * l6) / F::max(F::new(0.1), l3 + l4 + l5 + l6);
+            modulation_force = op3_mod + op4_mod;
+            base_amp = (l1 + l2) * F::new(0.3);
+        } else {
+            carrier_freq = f1;
+            mod_freq = f2;
+            let raw_stack = l2 * r2 + l3 * r3 + l4 * r4 + l5 * r5 + l6 * (f6_effective / F::max(F::new(1.0), current_base_freq));
+            modulation_force = F::log1p(raw_stack) * F::new(1.5);
+            base_amp = l1 * F::new(0.5);
+        }
 
-                if algo_select == 0 {
-                    let op3_mod = l3 * F::max(F::new(0.1), r3);
-                    let op4_mod = l4 * F::max(F::new(0.1), r4);
-                    carrier_freq = (f1 * l1 + f2 * l2) / F::max(F::new(0.05), l1 + l2);
-                    mod_freq = (f3 * l3 + f4 * l4 + f5 * l5 + f6_effective * l6) / F::max(F::new(0.1), l3 + l4 + l5 + l6);
-                    modulation_force = op3_mod + op4_mod;
-                    base_amp = (l1 + l2) * F::new(0.3);
-                } else {
-                    carrier_freq = f1;
-                    mod_freq = f2;
-                    let raw_stack = l2 * r2 + l3 * r3 + l4 * r4 + l5 * r5 + l6 * (f6_effective / F::max(F::new(1.0), base_freq));
-                    modulation_force = F::log1p(raw_stack) * F::new(1.5);
-                    base_amp = l1 * F::new(0.5);
-                }
+        // 2. DIREKTE GENERIERUNG DER SEITENBÄNDER
+        let max_sidebands = 16; 
 
-                // 2. KONTINUIERLICHE SEITENBAND-ANALYSE
-                let distance_to_carrier = F::abs(bin_freq - carrier_freq);
-                let exact_sideband_order = distance_to_carrier / F::max(F::new(1.0), mod_freq);
-                
-                let order_lower = F::floor(exact_sideband_order);
-                let order_upper = order_lower + F::new(1.0);
+        for sideband in 0..max_sidebands {
+            let order = F::cast_from(sideband);
+            
+            // Berechne Amplitudenabfall der Ordnung
+            let mut sideband_amp = base_amp / (F::new(1.0) + order * order);
+            if modulation_force > F::new(0.01) {
+                sideband_amp = sideband_amp * (F::new(1.0) + modulation_force * F::new(0.2));
+            } else if sideband > 0 {
+                sideband_amp = F::new(0.0);
+            }
 
-                let sign = if bin_freq >= carrier_freq { F::new(1.0) } else { -F::new(1.0) };
-                let real_freq_lower = carrier_freq + (sign * order_lower * mod_freq);
-                let real_freq_upper = carrier_freq + (sign * order_upper * mod_freq);
+            if sideband_amp > F::new(0.0001) {
+                // Symmetrische Erzeugung: Unteres (0) und oberes (1) Seitenband abarbeiten
+                for sign_idx in 0..2 {
+                    // KORREKTUR: "continue" durch invertierte "if"-Bedingung ersetzt!
+                    if !(sideband == 0 && sign_idx == 1) { 
+                        
+                        let sign = if sign_idx == 0 { F::new(-1.0) } else { F::new(1.0) };
+                        let real_freq = carrier_freq + (sign * order * mod_freq);
 
-                let dist_to_lower = F::abs(bin_freq - real_freq_lower);
-                let dist_to_upper = F::abs(bin_freq - real_freq_upper);
+                        // Nur berechnen, wenn die Frequenz innerhalb des hörbaren Nyquist-Bereichs liegt
+                        if real_freq > F::new(10.0) && real_freq < sample_rate / F::new(2.0) {
+                            
+                            // FILTER INTEGRATION
+                            let filter_gain = if real_freq <= current_modulated_cutoff { F::new(1.0) } else { F::new(0.0) };
+                            
+                            if filter_gain > F::new(0.0) {
+                                let filtered_synth_real = sideband_amp * filter_gain;
 
-                let rand_l_real = (F::sin(k_f * F::new(12.9898)) - F::floor(F::sin(k_f * F::new(12.9898)))) * F::new(2.0) - F::new(1.0);
-                let rand_l_imag = (F::cos(k_f * F::new(78.2330)) - F::floor(F::cos(k_f * F::new(78.2330)))) * F::new(2.0) - F::new(1.0);
-                let rand_r_real = (F::sin(k_f * F::new(45.1640)) - F::floor(F::sin(k_f * F::new(45.1640)))) * F::new(2.0) - F::new(1.0);
-                let rand_r_imag = (F::cos(k_f * F::new(92.7410)) - F::floor(F::cos(k_f * F::new(92.7410)))) * F::new(2.0) - F::new(1.0);
+                                // REVERB SEEDING
+                                let rand_l_real = (F::sin(order * F::new(12.9898)) - F::floor(F::sin(order * F::new(12.9898)))) * F::new(2.0) - F::new(1.0);
+                                let rand_l_imag = (F::cos(order * F::new(78.2330)) - F::floor(F::cos(order * F::new(78.2330)))) * F::new(2.0) - F::new(1.0);
+                                let rand_r_real = (F::sin(order * F::new(45.1640)) - F::floor(F::sin(order * F::new(45.1640)))) * F::new(2.0) - F::new(1.0);
+                                // KORREKTUR: Unbekanntes 'k_f' durch 'order' ersetzt!
+                                let rand_r_imag = (F::cos(order * F::new(92.7410)) - F::floor(F::cos(order * F::new(92.7410)))) * F::new(2.0) - F::new(1.0);
 
-                // --- PROZESSING: UNTERES SEITENBAND ---
-                if dist_to_lower < bin_width {
-                    let filter_gain = if real_freq_lower <= modulated_cutoff { F::new(1.0) } else { F::new(0.0) };
-                    
-                    if filter_gain > F::new(0.0) {
-                        let bin_proximity_weight = F::new(1.0) - (dist_to_lower / bin_width);
-                        let mut sideband_amp = base_amp / (F::new(1.0) + order_lower * order_lower);
-                        if modulation_force > F::new(0.01) {
-                            sideband_amp = sideband_amp * (F::new(1.0) + modulation_force * F::new(0.2));
-                        } else if order_lower > F::new(0.5) { 
-                            sideband_amp = F::new(0.0); 
+                                let freq_factor = F::new(1.0) + (real_freq * high_freq_damping * F::new(0.0001));
+                                let effective_decay = room_size_seconds / freq_factor;
+                                let amplitude_decay = F::exp(-order / F::max(F::new(1.0), effective_decay * F::new(10.0)));
+
+                                let ir_l_real = rand_l_real * amplitude_decay; let ir_l_imag = rand_l_imag * amplitude_decay;
+                                let ir_r_real = rand_r_real * amplitude_decay; let ir_r_imag = rand_r_imag * amplitude_decay;
+
+                                let mid_real = (ir_l_real + ir_r_real) * F::new(0.5); let mid_imag = (ir_l_imag + ir_r_imag) * F::new(0.5);
+                                let final_l_real = mid_real + stereo_width * (ir_l_real - mid_real); let final_l_imag = mid_imag + stereo_width * (ir_l_imag - mid_imag);
+                                let final_r_real = mid_real + stereo_width * (ir_r_real - mid_real); let final_r_imag = mid_imag + stereo_width * (ir_r_imag - mid_imag);
+
+                                let wet_l_real = filtered_synth_real * final_l_real; let wet_l_imag = filtered_synth_real * final_l_imag;
+                                let wet_r_real = filtered_synth_real * final_r_real; let wet_r_imag = filtered_synth_real * final_r_imag;
+
+                                let res_l_real = (F::new(1.0) - wet_dry_mix) * filtered_synth_real + wet_dry_mix * wet_l_real;
+                                let res_l_imag = wet_dry_mix * wet_l_imag;
+                                let res_r_real = (F::new(1.0) - wet_dry_mix) * filtered_synth_real + wet_dry_mix * wet_r_real;
+                                let res_r_imag = wet_dry_mix * wet_r_imag;
+
+                                // ABSOLUTE, BLOCKÜBERGREIFEND LÜCKENLOSE PHASEN-ROTATION
+                                let exact_k_f = (real_freq * samples_per_block_f) / sample_rate;
+                                let base_exact_k_f = (old_frequency * samples_per_block_f) / sample_rate;
+                                
+                                let phase_history = (F::new(2.0) * pi * base_exact_k_f * block_start_sample) / samples_per_block_f;
+                                let phase_local = (F::new(2.0) * pi * exact_k_f * local_sample_n) / samples_per_block_f;
+                                
+                                let angle = phase_history + phase_local;
+                                let cos_a = F::cos(angle); let sin_a = F::sin(angle);
+
+                                final_sample_l += res_l_real * cos_a - res_l_imag * sin_a;
+                                final_sample_r += res_r_real * cos_a - res_r_imag * sin_a;
+                            }
                         }
-                        
-                        let filtered_synth_real = sideband_amp * bin_proximity_weight * filter_gain;
-
-                        let freq_factor = F::new(1.0) + (real_freq_lower * high_freq_damping * F::new(0.0001));
-                        let effective_decay = room_size_seconds / freq_factor;
-                        let amplitude_decay = F::exp(-k_f / F::max(F::new(1.0), effective_decay * F::new(10.0)));
-
-                        let ir_l_real = rand_l_real * amplitude_decay; let ir_l_imag = rand_l_imag * amplitude_decay;
-                        let ir_r_real = rand_r_real * amplitude_decay; let ir_r_imag = rand_r_imag * amplitude_decay;
-
-                        let mid_real = (ir_l_real + ir_r_real) * F::new(0.5); let mid_imag = (ir_l_imag + ir_r_imag) * F::new(0.5);
-                        let final_l_real = mid_real + stereo_width * (ir_l_real - mid_real); let final_l_imag = mid_imag + stereo_width * (ir_l_imag - mid_imag);
-                        let final_r_real = mid_real + stereo_width * (ir_r_real - mid_real); let final_r_imag = mid_imag + stereo_width * (ir_r_imag - mid_imag);
-
-                        let wet_l_real = filtered_synth_real * final_l_real; let wet_l_imag = filtered_synth_real * final_l_imag;
-                        let wet_r_real = filtered_synth_real * final_r_real; let wet_r_imag = filtered_synth_real * final_r_imag;
-
-                        let res_l_real = (F::new(1.0) - wet_dry_mix) * filtered_synth_real + wet_dry_mix * wet_l_real;
-                        let res_l_imag = wet_dry_mix * wet_l_imag;
-                        let res_r_real = (F::new(1.0) - wet_dry_mix) * filtered_synth_real + wet_dry_mix * wet_r_real;
-                        let res_r_imag = wet_dry_mix * wet_r_imag;
-
-                        // KORREKTUR: Mathematisch stetige Phasenberechnung ohne Blockgrenzen-Sprung
-                        let exact_k_f = (real_freq_lower * samples_per_block_f) / sample_rate;
-                        
-                        // 1. Der historische Phasenanteil basierend auf old_frequency (stabil bis zum aktuellen Block)
-                        let base_exact_k_f = (old_frequency * samples_per_block_f) / sample_rate; // Struktur-Anker
-                        let phase_history = (F::new(2.0) * pi * base_exact_k_f * block_start_sample) / samples_per_block_f;
-                        
-                        // 2. Der block-lokale Phasenanteil (isoliert innerhalb des Blocks von 0..n)
-                        let phase_local = (F::new(2.0) * pi * exact_k_f * local_sample_n) / samples_per_block_f;
-                        
-                        let angle = phase_history + phase_local;
-                        let cos_a = F::cos(angle); let sin_a = F::sin(angle);
-
-                        final_sample_l += res_l_real * cos_a - res_l_imag * sin_a;
-                        final_sample_r += res_r_real * cos_a - res_r_imag * sin_a;
                     }
                 }
+            }
+        }
 
-                // --- PROZESSING: OBERES SEITENBAND ---
-                if dist_to_upper < bin_width {
-                    let filter_gain = if real_freq_upper <= modulated_cutoff { F::new(1.0) } else { F::new(0.0) };
-                    
-                    if filter_gain > F::new(0.0) {
-                        let bin_proximity_weight = F::new(1.0) - (dist_to_upper / bin_width);
-                        let mut sideband_amp = base_amp / (F::new(1.0) + order_upper * order_upper);
-                        if modulation_force > F::new(0.01) {
-                            sideband_amp = sideband_amp * (F::new(1.0) + modulation_force * F::new(0.2));
-                        } else if order_upper > F::new(0.5) { 
-                            sideband_amp = F::new(0.0); 
-                        }
-                        
-                        let filtered_synth_real = sideband_amp * bin_proximity_weight * filter_gain;
-
-                        let freq_factor = F::new(1.0) + (real_freq_upper * high_freq_damping * F::new(0.0001));
-                        let effective_decay = room_size_seconds / freq_factor;
-                        let amplitude_decay = F::exp(-k_f / F::max(F::new(1.0), effective_decay * F::new(10.0)));
-
-                        let ir_l_real = rand_l_real * amplitude_decay; let ir_l_imag = rand_l_imag * amplitude_decay;
-                        let ir_r_real = rand_r_real * amplitude_decay; let ir_r_imag = rand_r_imag * amplitude_decay;
-
-                        let mid_real = (ir_l_real + ir_r_real) * F::new(0.5); let mid_imag = (ir_l_imag + ir_r_imag) * F::new(0.5);
-                        let final_l_real = mid_real + stereo_width * (ir_l_real - mid_real); let final_l_imag = mid_imag + stereo_width * (ir_l_imag - mid_imag);
-                        let final_r_real = mid_real + stereo_width * (ir_r_real - mid_real); let final_r_imag = mid_imag + stereo_width * (ir_r_imag - mid_imag);
-
-                        let wet_l_real = filtered_synth_real * final_l_real; let wet_l_imag = filtered_synth_real * final_l_imag;
-                        let wet_r_real = filtered_synth_real * final_r_real; let wet_r_imag = filtered_synth_real * final_r_imag;
-
-let res_l_real = (F::new(1.0) - wet_dry_mix) * filtered_synth_real + wet_dry_mix * wet_l_real;
-let res_l_imag = wet_dry_mix * wet_l_imag;
-let res_r_real = (F::new(1.0) - wet_dry_mix) * filtered_synth_real + wet_dry_mix * wet_r_real;
-let res_r_imag = wet_dry_mix * wet_r_imag;
-// KORREKTUR: Mathematisch stetige Phasenberechnung für das obere Seitenband
-let exact_k_f = (real_freq_upper * samples_per_block_f) / sample_rate;
-let base_exact_k_f = (old_frequency * samples_per_block_f) / sample_rate;
-let phase_history = (F::new(2.0) * pi * base_exact_k_f * block_start_sample) / samples_per_block_f;
-let phase_local = (F::new(2.0) * pi * exact_k_f * local_sample_n) / samples_per_block_f;
-let angle = phase_history + phase_local;
-let cos_a = F::cos(angle); let sin_a = F::sin(angle);
-final_sample_l += res_l_real * cos_a - res_l_imag * sin_a;
-final_sample_r += res_r_real * cos_a - res_r_imag * sin_a;
-}
-}
-}
-}
-// Finaler Stereo-Ausgabe-Schreibblock bleibt identisch
-let scale = F::new(2.0) / samples_per_block;
-let idx_l: usize = (n * 2) as usize;
-let idx_r: usize = (n * 2 + 1) as usize;
-output_stereo_audio[idx_l] = final_sample_l * scale * master_amp;
-output_stereo_audio[idx_r] = final_sample_r * scale * master_amp;
-}
+        // 3. SKALIERUNG UND SICHERER AUDIO-OUTPUT
+        let scale = F::new(0.15); 
+        let idx_l: usize = (n * 2) as usize;
+        let idx_r: usize = (n * 2 + 1) as usize;
+        
+        output_stereo_audio[idx_l] = final_sample_l * scale * master_amp;
+        output_stereo_audio[idx_r] = final_sample_r * scale * master_amp;
+    }
 }
