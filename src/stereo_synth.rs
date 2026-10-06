@@ -140,32 +140,26 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
 
         let block_progress = F::cast_from(n) / samples_per_block;
 
+        // --- LFO: Phase-akkumulierende Sinus-Modulation, blockübergreifend stetig ---
+        // lfo_accumulated_phase wird auf dem Host pro Block um 2π·f·T_block
+        // weitergeschaltet; hier kommt die lokale Intra-Block-Phase dazu.
         let sample_phase_delta =
             (F::new(2.0) * pi * lfo_frequency * block_progress * samples_per_block) / sample_rate;
         let lfo_mod = F::sin(lfo_accumulated_phase + sample_phase_delta);
 
-        let base_freq = old_frequency + (block_progress * (frequency - old_frequency));
+        // --- PER-SAMPLE GLÄTTUNG: Frequenz + Cutoff (Portamento) ---
+        let current_base_freq = old_frequency + (block_progress * (frequency - old_frequency));
         let base_cutoff = old_cutoff + (block_progress * (dyn_cutoff - old_cutoff));
 
+        // LFO moduliert den Cutoff — DAS ist der Signalpfad, den der Filter nutzt.
         let mut modulated_cutoff = base_cutoff + (lfo_mod * lfo_depth);
         if modulated_cutoff < F::new(50.0) {
             modulated_cutoff = F::new(50.0);
         }
 
-           // ... (Dein ADSR- und Operator-Setup bleibt identisch) ...
-
-                // ... (Dein ADSR- und LFO-Setup bleibt absolut unberührt) ...
-
-        let num_bins = fft_size / 2 + 1;
         let samples_per_block_f = samples_per_block;
-        
         let block_start_sample = F::cast_from(global_block_index) * samples_per_block_f;
         let local_sample_n = F::cast_from(n);
-        let block_progress = local_sample_n / samples_per_block_f;
-
-        // 1. FREQUENZ-INTERPOLATION PRO SAMPLE
-        let current_base_freq = old_frequency + (block_progress * (frequency - old_frequency));
-        let current_modulated_cutoff = old_cutoff + (block_progress * (dyn_cutoff - old_cutoff));
 
         let r1 = op_ratios[0]; let l1 = op_levels[0];
         let r2 = op_ratios[1]; let l2 = op_levels[1];
@@ -250,7 +244,7 @@ pub fn cubek_true_stereo_synth_reverb<F: Float + CubeElement>(
 
                         if real_freq > F::new(10.0) && real_freq < sample_rate / F::new(2.0) {
                             
-                            let filter_gain = if real_freq <= current_modulated_cutoff { F::new(1.0) } else { F::new(0.0) };
+                            let filter_gain = if real_freq <= modulated_cutoff { F::new(1.0) } else { F::new(0.0) };
                             
                             if filter_gain > F::new(0.0) {
                                 let filtered_synth_real = sideband_amp * filter_gain;
