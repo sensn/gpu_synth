@@ -97,6 +97,12 @@ pub struct WebAudioEngine {
     block_count: Cell<u32>,
     // POLYPHONIE: Voice-Tabelle statt einzelner Mono-Note-Events
     voices: RefCell<[Voice; MAX_VOICES]>,
+    // REVERB-HISTORIE (Ping-Pong): persistenter GPU-Buffer mit dem
+    // getrockneten Mix des VORHERIGEN Blocks. Die FIR im Mixer faltet
+    // über ihn — der Nachhall fließt kontinuierlich über Blockgrenzen.
+    // Ohne ihn bricht das block-lokale FIR bei jedem Blockanfang auf
+    // 1 Tap zusammen => abgehackter Klang (~94-Hz-Wiederholung).
+    dry_prev: RefCell<Option<cubecl::server::Handle>>,
 }
 
 #[wasm_bindgen]
@@ -111,6 +117,7 @@ impl WebAudioEngine {
             lfo_phase: Cell::new(0.0),
             block_count: Cell::new(0),
             voices: RefCell::new([Voice::new(); MAX_VOICES]),
+            dry_prev: RefCell::new(None),
         }
     }
 
@@ -490,9 +497,10 @@ impl WebAudioEngine {
         );
 
         // --- STUFE 2a: IR-PRECOMPUTE (einmal pro Block) ---
-        // Berechnet die fft_size Reverb-Taps (4 Werte pro Tap) mit allen
-        // Transzendentalfunktionen EINMAL — die Faltung im Mixer ist danach
-        // reines Multiplizieren/Addieren.
+        // fft_size Reverb-Taps (4 Werte pro Tap) mit allen Transzendenten
+        // EINMAL berechnet — die Faltung im Mixer ist danach reines
+        // Multiplizieren/Addieren. IR-Gain ist Energie-normalisiert
+        // (0.0375 statt 0.15), damit 512 Taps nicht ins Clipping explodieren.
         let ir_len = self.fft_size as usize * 4;
         let ir_bytes = cubecl::bytes::Bytes::from_bytes_vec(
             bytemuck::cast_slice(&vec![0.0f32; ir_len]).to_vec(),
@@ -519,14 +527,28 @@ impl WebAudioEngine {
         );
 
         // --- STUFE 2b: MIXER-LAUNCH (einmal pro Block) ---
-        // Summiert alle Stimmen (Equal-Power), faltet mit der vorberechneten
-        // IR (Block-FIR), mischt Wet/Dry und clippt. Readback NUR hier.
+        // WAHRE FALTUNG MIT BLOCK-HISTORIE: dry_prev hält den getrockneten
+        // Mix des vorherigen Blocks als persistenter GPU-Buffer. Die FIR
+        // summiert über den aktuellen Block UND die Historie — der Nachhall
+        // bricht am Blockanfang nicht zusammen (Kontinuitäts-Fix).
+        let dry_prev_handle = {
+            let mut prev = self.dry_prev.borrow_mut();
+            if prev.is_none() {
+                let zeros = cubecl::bytes::Bytes::from_bytes_vec(
+                    bytemuck::cast_slice(&vec![0.0f32; output_len]).to_vec(),
+                );
+                *prev = Some(client.create(zeros));
+            }
+            prev.as_ref().unwrap().clone()
+        };
+
         let final_bytes = cubecl::bytes::Bytes::from_bytes_vec(
             bytemuck::cast_slice(&vec![0.0f32; output_len]).to_vec(),
         );
         let handle_final = client.create(final_bytes);
 
-        let arg_voices_mix = unsafe { ArrayArg::from_raw_parts(handle_mixed.clone(), output_len) };
+        let arg_dry_cur = unsafe { ArrayArg::from_raw_parts(handle_mixed.clone(), output_len) };
+        let arg_dry_prev = unsafe { ArrayArg::from_raw_parts(dry_prev_handle, output_len) };
         let arg_ir_mix = unsafe { ArrayArg::from_raw_parts(handle_ir.clone(), ir_len) };
         let arg_final = unsafe { ArrayArg::from_raw_parts(handle_final.clone(), output_len) };
 
@@ -534,12 +556,19 @@ impl WebAudioEngine {
             &client,
             grid_dim.clone(),
             cube_dim.clone(),
-            arg_voices_mix,
+            arg_dry_cur,
+            arg_dry_prev,
             arg_ir_mix,
             arg_final,
             wet_mix,
             self.fft_size, // #[comptime] fft_size
         );
+
+        // HISTORIE FÜR DEN NÄCHSTEN BLOCK: Der getrocknete Mix DIESES Blocks
+        // (handle_mixed) wird zum dry_prev des nächsten. Die GPU-Befehle sind
+        // bereits mit den richtigen Bindings eingereiht — hier wird nur das
+        // Host-Bookkeeping getauscht.
+        *self.dry_prev.borrow_mut() = Some(handle_mixed);
 
         // READBACK: NUR der finale Stereo-Block (1 Handle statt N).
         future_to_promise(async move {
