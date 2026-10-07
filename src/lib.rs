@@ -5,8 +5,11 @@ use std::cell::{Cell, RefCell};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
-pub mod stereo_synth;
-use stereo_synth::cubek_true_stereo_synth_reverb;
+pub mod stereo_synth; // LEGACY: alter Mono-Kernel (Referenz, bis Migration stabil)
+pub mod voice_synth; // STUFE 1: trockener FM-Synth-Kernel pro Stimme
+pub mod mixer_kernel; // STUFE 2: Mixer (Summe + Reverb + Width + Wet/Dry + Clip)
+use mixer_kernel::{cubek_ir_precompute, cubek_mixer_kernel, cubek_voice_sum};
+use voice_synth::cubek_voice_synth;
 
 // ============================================================
 // POLYPHONIE: Voice-Tabelle — ein Kernel-Launch pro Stimme
@@ -375,9 +378,16 @@ impl WebAudioEngine {
             })
             .unwrap_or(usize::MAX);
 
-        // EIN KERNEL-LAUNCH PRO STIMME — derselbe kompilierte Kernel,
-        // stimmen-spezifische Skalar-Argumente, gemeinsame globale Parameter.
-        let mut handles_out = Vec::with_capacity(active.len());
+        // EIN STUFE-1-LAUNCH PRO STIMME (trockenes FM/ADSR/Phasen-Signal)
+        // in den planaren Sammel-Buffer: [Stimme v][L R L R ...] hintereinander.
+        // Danach EIN Stufe-2-Mixer-Launch: Summe + Reverb + Width + Wet/Dry + Clip.
+        let num_voices = active.len() as u32;
+        let voices_buf_len = output_len * num_voices as usize;
+        let voices_bytes = cubecl::bytes::Bytes::from_bytes_vec(
+            bytemuck::cast_slice(&vec![0.0f32; voices_buf_len]).to_vec(),
+        );
+        let handle_voices = client.create(voices_bytes);
+
         for (i, v) in active.iter().enumerate() {
             let target_freq = if i == lead_idx {
                 frequency
@@ -385,20 +395,18 @@ impl WebAudioEngine {
                 v.frequency
             };
 
-            let initial_data = vec![0.0f32; output_len];
-            let raw_bytes =
-                cubecl::bytes::Bytes::from_bytes_vec(bytemuck::cast_slice(&initial_data).to_vec());
-            let handle_out = client.create(raw_bytes);
-
-            let arg_audio = unsafe { ArrayArg::from_raw_parts(handle_out.clone(), output_len) };
+            // Alle Stimmen teilen sich EINEN Sammel-Buffer; jede Stimme
+            // adressiert ihre eigene planare Region über voice_index.
+            let arg_voices = unsafe { ArrayArg::from_raw_parts(handle_voices.clone(), voices_buf_len) };
             let arg_ratios = unsafe { ArrayArg::from_raw_parts(handle_ratios.clone(), 6) };
             let arg_levels = unsafe { ArrayArg::from_raw_parts(handle_levels.clone(), 6) };
 
-            cubek_true_stereo_synth_reverb::launch::<f32, WgpuRuntime>(
+            cubek_voice_synth::launch::<f32, WgpuRuntime>(
                 &client,
                 grid_dim.clone(),
                 cube_dim.clone(),
-                arg_audio,
+                arg_voices,
+                i as u32, // voice_index: eigene Region im Sammel-Buffer
                 target_freq,
                 v.old_frequency,
                 cutoff,
@@ -408,15 +416,8 @@ impl WebAudioEngine {
                 arg_ratios,
                 arg_levels,
                 algo_select,
-                moog_res,
-                obe_res,
-                obe_mode,
                 lfo_freq,
                 lfo_depth,
-                room_size,
-                high_freq_damping,
-                wet_mix,
-                stereo_width,
                 attack,
                 decay,
                 sustain,
@@ -427,7 +428,6 @@ impl WebAudioEngine {
                 current_block_index, // Globaler Block-Zähler für die absolute IDFT-Phase
                 self.fft_size,       // #[comptime] fft_size
             );
-            handles_out.push(handle_out);
         }
 
         let block_duration = (self.fft_size as f32) / self.sample_rate.get();
@@ -468,19 +468,88 @@ impl WebAudioEngine {
             }
         }
 
-        // CPU-MIX mit Equal-Power-Skalierung: gleiche Lautheit unabhängig von
-        // der Stimmenzahl, verhindert Clipping bei Akkorden.
-        let num_voices = active.len();
-        let voice_scale = 1.0 / (num_voices as f32).sqrt();
+        // --- STUFE 1.5: STIMMEN-SUMME (einmal pro Block) ---
+        // Equal-Power-Mix aller Stimmen in einen eigenen Buffer, damit die
+        // Faltung im Mixer die SUMME faltet (nicht nur Stimme 0).
+        let mixed_bytes = cubecl::bytes::Bytes::from_bytes_vec(
+            bytemuck::cast_slice(&vec![0.0f32; output_len]).to_vec(),
+        );
+        let handle_mixed = client.create(mixed_bytes);
 
+        let arg_voices_sum = unsafe { ArrayArg::from_raw_parts(handle_voices.clone(), voices_buf_len) };
+        let arg_mixed = unsafe { ArrayArg::from_raw_parts(handle_mixed.clone(), output_len) };
+
+        cubek_voice_sum::launch::<f32, WgpuRuntime>(
+            &client,
+            grid_dim.clone(),
+            cube_dim.clone(),
+            arg_voices_sum,
+            arg_mixed,
+            num_voices,
+            self.fft_size, // #[comptime] fft_size
+        );
+
+        // --- STUFE 2a: IR-PRECOMPUTE (einmal pro Block) ---
+        // Berechnet die fft_size Reverb-Taps (4 Werte pro Tap) mit allen
+        // Transzendentalfunktionen EINMAL — die Faltung im Mixer ist danach
+        // reines Multiplizieren/Addieren.
+        let ir_len = self.fft_size as usize * 4;
+        let ir_bytes = cubecl::bytes::Bytes::from_bytes_vec(
+            bytemuck::cast_slice(&vec![0.0f32; ir_len]).to_vec(),
+        );
+        let handle_ir = client.create(ir_bytes);
+
+        let arg_ir = unsafe { ArrayArg::from_raw_parts(handle_ir.clone(), ir_len) };
+
+        cubek_ir_precompute::launch::<f32, WgpuRuntime>(
+            &client,
+            grid_dim.clone(),
+            cube_dim.clone(),
+            arg_ir,
+            self.sample_rate.get(),
+            current_lfo_phase,
+            lfo_freq,
+            lfo_depth,
+            cutoff,
+            old_cut,
+            room_size,
+            high_freq_damping,
+            stereo_width,
+            self.fft_size, // #[comptime] fft_size
+        );
+
+        // --- STUFE 2b: MIXER-LAUNCH (einmal pro Block) ---
+        // Summiert alle Stimmen (Equal-Power), faltet mit der vorberechneten
+        // IR (Block-FIR), mischt Wet/Dry und clippt. Readback NUR hier.
+        let final_bytes = cubecl::bytes::Bytes::from_bytes_vec(
+            bytemuck::cast_slice(&vec![0.0f32; output_len]).to_vec(),
+        );
+        let handle_final = client.create(final_bytes);
+
+        let arg_voices_mix = unsafe { ArrayArg::from_raw_parts(handle_mixed.clone(), output_len) };
+        let arg_ir_mix = unsafe { ArrayArg::from_raw_parts(handle_ir.clone(), ir_len) };
+        let arg_final = unsafe { ArrayArg::from_raw_parts(handle_final.clone(), output_len) };
+
+        cubek_mixer_kernel::launch::<f32, WgpuRuntime>(
+            &client,
+            grid_dim.clone(),
+            cube_dim.clone(),
+            arg_voices_mix,
+            arg_ir_mix,
+            arg_final,
+            wet_mix,
+            self.fft_size, // #[comptime] fft_size
+        );
+
+        // READBACK: NUR der finale Stereo-Block (1 Handle statt N).
         future_to_promise(async move {
-            let result_bytes_res = client.read_async(handles_out).await;
+            let result_bytes_res = client.read_async(vec![handle_final]).await;
             let result_bytes_vec = result_bytes_res.expect("WebGPU Lesevorgang fehlgeschlagen");
             let mut mixed = vec![0.0f32; output_len];
             for bytes in &result_bytes_vec {
                 let samples: &[f32] = bytemuck::cast_slice(bytes.as_ref());
                 for (acc, s) in mixed.iter_mut().zip(samples.iter()) {
-                    *acc += s * voice_scale;
+                    *acc += s;
                 }
             }
             let js_array = js_sys::Float32Array::from(mixed.as_slice());
