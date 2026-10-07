@@ -8,7 +8,7 @@ use wasm_bindgen_futures::future_to_promise;
 pub mod stereo_synth; // LEGACY: alter Mono-Kernel (Referenz, bis Migration stabil)
 pub mod voice_synth; // STUFE 1: trockener FM-Synth-Kernel pro Stimme
 pub mod mixer_kernel; // STUFE 2: Mixer (Summe + Reverb + Width + Wet/Dry + Clip)
-use mixer_kernel::{cubek_ir_precompute, cubek_mixer_kernel, cubek_voice_sum};
+use mixer_kernel::cubek_mixer_kernel;
 use voice_synth::cubek_voice_synth;
 
 // ============================================================
@@ -97,12 +97,6 @@ pub struct WebAudioEngine {
     block_count: Cell<u32>,
     // POLYPHONIE: Voice-Tabelle statt einzelner Mono-Note-Events
     voices: RefCell<[Voice; MAX_VOICES]>,
-    // REVERB-HISTORIE (Ping-Pong): persistenter GPU-Buffer mit dem
-    // getrockneten Mix des VORHERIGEN Blocks. Die FIR im Mixer faltet
-    // über ihn — der Nachhall fließt kontinuierlich über Blockgrenzen.
-    // Ohne ihn bricht das block-lokale FIR bei jedem Blockanfang auf
-    // 1 Tap zusammen => abgehackter Klang (~94-Hz-Wiederholung).
-    dry_prev: RefCell<Option<cubecl::server::Handle>>,
 }
 
 #[wasm_bindgen]
@@ -117,7 +111,6 @@ impl WebAudioEngine {
             lfo_phase: Cell::new(0.0),
             block_count: Cell::new(0),
             voices: RefCell::new([Voice::new(); MAX_VOICES]),
-            dry_prev: RefCell::new(None),
         }
     }
 
@@ -423,8 +416,15 @@ impl WebAudioEngine {
                 arg_ratios,
                 arg_levels,
                 algo_select,
+                moog_res,
+                obe_res,
+                obe_mode,
                 lfo_freq,
                 lfo_depth,
+                room_size,
+                high_freq_damping,
+                wet_mix,
+                stereo_width,
                 attack,
                 decay,
                 sustain,
@@ -475,9 +475,13 @@ impl WebAudioEngine {
             }
         }
 
-        // --- STUFE 1.5: STIMMEN-SUMME (einmal pro Block) ---
-        // Equal-Power-Mix aller Stimmen in einen eigenen Buffer, damit die
-        // Faltung im Mixer die SUMME faltet (nicht nur Stimme 0).
+        // --- STUFE 2: MIXER-LAUNCH (einmal pro Block) ---
+        // PURE EQUAL-POWER-SUMME — exakt die Operation, die der alte
+        // funktionierende CPU-Mix nach dem Readback gemacht hat. Das ganze
+        // DSP (inkl. stateless Reverb, Width, Wet/Dry, Limiter) steckt in
+        // der Stimme selbst (voice_synth.rs, 1:1 vom Legacy-Kernel).
+        // Damit ist der Signalpfad bit-identisch zum Zustand vor dem
+        // Refactoring: Kernel(Stimme) → Summe → Readback → Worklet.
         let mixed_bytes = cubecl::bytes::Bytes::from_bytes_vec(
             bytemuck::cast_slice(&vec![0.0f32; output_len]).to_vec(),
         );
@@ -486,7 +490,7 @@ impl WebAudioEngine {
         let arg_voices_sum = unsafe { ArrayArg::from_raw_parts(handle_voices.clone(), voices_buf_len) };
         let arg_mixed = unsafe { ArrayArg::from_raw_parts(handle_mixed.clone(), output_len) };
 
-        cubek_voice_sum::launch::<f32, WgpuRuntime>(
+        cubek_mixer_kernel::launch::<f32, WgpuRuntime>(
             &client,
             grid_dim.clone(),
             cube_dim.clone(),
@@ -496,83 +500,9 @@ impl WebAudioEngine {
             self.fft_size, // #[comptime] fft_size
         );
 
-        // --- STUFE 2a: IR-PRECOMPUTE (einmal pro Block) ---
-        // fft_size Reverb-Taps (4 Werte pro Tap) mit allen Transzendenten
-        // EINMAL berechnet — die Faltung im Mixer ist danach reines
-        // Multiplizieren/Addieren. IR-Gain ist Energie-normalisiert
-        // (0.0375 statt 0.15), damit 512 Taps nicht ins Clipping explodieren.
-        let ir_len = self.fft_size as usize * 4;
-        let ir_bytes = cubecl::bytes::Bytes::from_bytes_vec(
-            bytemuck::cast_slice(&vec![0.0f32; ir_len]).to_vec(),
-        );
-        let handle_ir = client.create(ir_bytes);
-
-        let arg_ir = unsafe { ArrayArg::from_raw_parts(handle_ir.clone(), ir_len) };
-
-        cubek_ir_precompute::launch::<f32, WgpuRuntime>(
-            &client,
-            grid_dim.clone(),
-            cube_dim.clone(),
-            arg_ir,
-            self.sample_rate.get(),
-            current_lfo_phase,
-            lfo_freq,
-            lfo_depth,
-            cutoff,
-            old_cut,
-            room_size,
-            high_freq_damping,
-            stereo_width,
-            self.fft_size, // #[comptime] fft_size
-        );
-
-        // --- STUFE 2b: MIXER-LAUNCH (einmal pro Block) ---
-        // WAHRE FALTUNG MIT BLOCK-HISTORIE: dry_prev hält den getrockneten
-        // Mix des vorherigen Blocks als persistenter GPU-Buffer. Die FIR
-        // summiert über den aktuellen Block UND die Historie — der Nachhall
-        // bricht am Blockanfang nicht zusammen (Kontinuitäts-Fix).
-        let dry_prev_handle = {
-            let mut prev = self.dry_prev.borrow_mut();
-            if prev.is_none() {
-                let zeros = cubecl::bytes::Bytes::from_bytes_vec(
-                    bytemuck::cast_slice(&vec![0.0f32; output_len]).to_vec(),
-                );
-                *prev = Some(client.create(zeros));
-            }
-            prev.as_ref().unwrap().clone()
-        };
-
-        let final_bytes = cubecl::bytes::Bytes::from_bytes_vec(
-            bytemuck::cast_slice(&vec![0.0f32; output_len]).to_vec(),
-        );
-        let handle_final = client.create(final_bytes);
-
-        let arg_dry_cur = unsafe { ArrayArg::from_raw_parts(handle_mixed.clone(), output_len) };
-        let arg_dry_prev = unsafe { ArrayArg::from_raw_parts(dry_prev_handle, output_len) };
-        let arg_ir_mix = unsafe { ArrayArg::from_raw_parts(handle_ir.clone(), ir_len) };
-        let arg_final = unsafe { ArrayArg::from_raw_parts(handle_final.clone(), output_len) };
-
-        cubek_mixer_kernel::launch::<f32, WgpuRuntime>(
-            &client,
-            grid_dim.clone(),
-            cube_dim.clone(),
-            arg_dry_cur,
-            arg_dry_prev,
-            arg_ir_mix,
-            arg_final,
-            wet_mix,
-            self.fft_size, // #[comptime] fft_size
-        );
-
-        // HISTORIE FÜR DEN NÄCHSTEN BLOCK: Der getrocknete Mix DIESES Blocks
-        // (handle_mixed) wird zum dry_prev des nächsten. Die GPU-Befehle sind
-        // bereits mit den richtigen Bindings eingereiht — hier wird nur das
-        // Host-Bookkeeping getauscht.
-        *self.dry_prev.borrow_mut() = Some(handle_mixed);
-
-        // READBACK: NUR der finale Stereo-Block (1 Handle statt N).
+        // READBACK: NUR der gemischte Stereo-Block (1 Handle statt N).
         future_to_promise(async move {
-            let result_bytes_res = client.read_async(vec![handle_final]).await;
+            let result_bytes_res = client.read_async(vec![handle_mixed]).await;
             let result_bytes_vec = result_bytes_res.expect("WebGPU Lesevorgang fehlgeschlagen");
             let mut mixed = vec![0.0f32; output_len];
             for bytes in &result_bytes_vec {

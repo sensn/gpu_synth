@@ -2,24 +2,26 @@
 use cubecl::prelude::*;
 
 // ============================================================
-// STUFE 1 (Refactoring_plan.md): TROCKENER FM-SYNTH-KERNEL
+// STUFE 1: FM-SYNTH-KERNEL PRO STIMME (VOLLSTÄNDIGES DSP)
 // ============================================================
-// Pro Stimme ein Launch. Enthält alles, was stimmen-spezifisch ist:
-//   - Absolute-Zeit-ADSR (Gate/Note-On/Note-Off auf globaler Sample-Achse)
+// 1:1-Übertragung des bewährten Legacy-Kernels (stereo_synth.rs):
+//   - Absolute-Zeit-ADSR (Gate/Note-On/Note-Off, globale Sample-Achse)
 //   - Portamento (old_frequency → frequency, per-Sample geglättet)
 //   - FM-Seitenband-Generierung (Algo 0/1, 6 Operatoren)
-//   - Phasenrekonstruktion (historischer Anker + lokale IDFT-Phase)
-//   - Brickwall-Filter (modulated_cutoff, LFO-moduliert)
-// Ausgabe: TROCKENES MONO-Signal (L=R=dry) in den planaren Sammel-Buffer
-// voices_dry — die eigene Stimme adressiert sich über voice_index selbst:
-//   voices_dry[voice_index * fft_size * 2 + n * 2]     = L
-//   voices_dry[voice_index * fft_size * 2 + n * 2 + 1] = R
-// Filter/Reverb/Width/Wet-Dry macht der Mixer (mixer_kernel.rs) EINMAL
-// für alle Stimmen.
+//   - Brickwall-Filter (LFO-modulierter Cutoff)
+//   - STATELESS Reverb: komplexer Per-Sideband-Gain (kein temporaler
+//     Zustand => kann an Blockgrenzen prinzipbedingt NICHT klicken)
+//   - Stereo-Width (M/S), Wet/Dry-Mix, Limiter
+// EINZIGE ÄNDERUNG gegenüber dem Legacy-Kernel: Die Stimme schreibt
+// ihren Stereo-Block in ihre eigene Region des gemeinsamen Sammel-
+// Buffers (voice_index):
+//   voices_out[voice_index * fft_size * 2 + n * 2]     = L
+//   voices_out[voice_index * fft_size * 2 + n * 2 + 1] = R
+// Der Mixer (mixer_kernel.rs) macht danach NUR die Equal-Power-Summe.
 
 #[cube(launch)]
 pub fn cubek_voice_synth<F: Float + CubeElement>(
-    voices_dry: &mut Array<F>,
+    voices_out: &mut Array<F>,
     voice_index: u32,
     frequency: F,
     old_frequency: F,
@@ -30,13 +32,21 @@ pub fn cubek_voice_synth<F: Float + CubeElement>(
     op_ratios: &Array<F>,
     op_levels: &Array<F>,
     algo_select: u32,
+    moog_resonance: F,
+    oberheim_resonance: F,
+    oberheim_mode: u32,
     lfo_frequency: F,
     lfo_depth: F,
+    room_size_seconds: F,
+    high_freq_damping: F,
+    wet_dry_mix: F,
+    stereo_width: F,
     attack_time: F,
     decay_time: F,
     sustain_level: F,
     release_time: F,
     // Note-Event-Zustand (vom Host verwaltet, absolute Sample-Zeitachse)
+    // gate_is_on: 1 = Gate offen (A/D/S), 0 = Gate zu (Release)
     gate_is_on: u32,
     note_on_sample: u32,
     note_off_sample: u32,
@@ -47,19 +57,23 @@ pub fn cubek_voice_synth<F: Float + CubeElement>(
     let n = ABSOLUTE_POS_X;
 
     if n < fft_size {
-        let mut final_sample = F::new(0.0);
+        let mut final_sample_l = F::new(0.0);
+        let mut final_sample_r = F::new(0.0);
         let pi = F::new(std::f32::consts::PI);
         let samples_per_block = F::cast_from(fft_size);
 
         // --- ABSOLUTE-TIME ADSR: Hüllkurve auf der globalen Sample-Zeitachse ---
+        // Alle Zeiten in Sekunden, blockübergreifend kontinuierlich (kein Block-Eiern mehr).
         let global_sample = F::cast_from(global_block_index) * samples_per_block + F::cast_from(n);
         let t_on = F::cast_from(note_on_sample);
         let t_off = F::cast_from(note_off_sample);
 
+        // Zeit seit Note-On in Sekunden (immer >= 0)
         let mut t_since_on = (global_sample - t_on) / sample_rate;
         if t_since_on < F::new(0.0) {
             t_since_on = F::new(0.0);
         }
+        // Zeit seit Note-Off in Sekunden (nur relevant wenn Gate zu)
         let mut t_since_off = (global_sample - t_off) / sample_rate;
         if t_since_off < F::new(0.0) {
             t_since_off = F::new(0.0);
@@ -68,16 +82,22 @@ pub fn cubek_voice_synth<F: Float + CubeElement>(
         let mut master_amp = F::new(0.0);
 
         if gate_is_on == 1 {
+            // --- ATTACK: linearer Anstieg von 0 auf 1 ---
             if t_since_on < attack_time {
                 master_amp = t_since_on / F::max(F::new(0.001), attack_time);
             } else if t_since_on < attack_time + decay_time {
+                // --- DECAY: exponentieller Abfall von 1 auf Sustain ---
                 let t_decay = t_since_on - attack_time;
                 let d = F::max(F::new(0.001), decay_time);
                 master_amp = sustain_level + (F::new(1.0) - sustain_level) * F::exp(-t_decay / d);
             } else {
+                // --- SUSTAIN ---
                 master_amp = sustain_level;
             }
         } else {
+            // --- RELEASE: exponentieller Abfall vom Pegel bei Note-Off ---
+            // Rekonstruiert den Pegel, den die Hüllkurve zum Note-Off-Zeitpunkt hatte,
+            // damit der Release nahtlos anschließt (kein Sprung).
             let amp_at_off = if t_off > t_on {
                 let t_at_off = (t_off - t_on) / sample_rate;
                 if t_at_off < attack_time {
@@ -99,6 +119,8 @@ pub fn cubek_voice_synth<F: Float + CubeElement>(
         let block_progress = F::cast_from(n) / samples_per_block;
 
         // --- LFO: Phase-akkumulierende Sinus-Modulation, blockübergreifend stetig ---
+        // lfo_accumulated_phase wird auf dem Host pro Block um 2π·f·T_block
+        // weitergeschaltet; hier kommt die lokale Intra-Block-Phase dazu.
         let sample_phase_delta =
             (F::new(2.0) * pi * lfo_frequency * block_progress * samples_per_block) / sample_rate;
         let lfo_mod = F::sin(lfo_accumulated_phase + sample_phase_delta);
@@ -107,6 +129,7 @@ pub fn cubek_voice_synth<F: Float + CubeElement>(
         let current_base_freq = old_frequency + (block_progress * (frequency - old_frequency));
         let base_cutoff = old_cutoff + (block_progress * (dyn_cutoff - old_cutoff));
 
+        // LFO moduliert den Cutoff — DAS ist der Signalpfad, den der Filter nutzt.
         let mut modulated_cutoff = base_cutoff + (lfo_mod * lfo_depth);
         if modulated_cutoff < F::new(50.0) {
             modulated_cutoff = F::new(50.0);
@@ -154,7 +177,8 @@ pub fn cubek_voice_synth<F: Float + CubeElement>(
             base_amp = l1 * F::new(0.5);
         }
 
-        // --- SCHRITT B: VORHERIGER BLOCK (HISTORISCHE ANKER-FREQUENZEN) ---
+        // --- KORREKTUR SCHRITT B: VORHERIGER BLOCK (HISTORISCHE ANKER-FREQUENZEN) ---
+        // Wir rekonstruieren die exakte FM-Struktur des letzten Blocks, um den Phasenübergang zu glätten!
         let old_f1 = old_frequency * r1;
         let old_f2 = old_frequency * r2;
         let old_f3 = old_frequency * r3;
@@ -193,6 +217,7 @@ pub fn cubek_voice_synth<F: Float + CubeElement>(
 
                         let sign = if sign_idx == 0 { F::new(-1.0) } else { F::new(1.0) };
 
+                        // Aktuelle Frequenz für den lokalen Blockteil
                         let real_freq = carrier_freq + (sign * order * mod_freq);
 
                         if real_freq > F::new(10.0) && real_freq < sample_rate / F::new(2.0) {
@@ -202,19 +227,50 @@ pub fn cubek_voice_synth<F: Float + CubeElement>(
                             if filter_gain > F::new(0.0) {
                                 let filtered_synth_real = sideband_amp * filter_gain;
 
+                                // REVERB SEEDING & PROCESSING (STATELESS: komplexer
+                                // Per-Sideband-Gain — kein temporaler Zustand, daher
+                                // keine Block-Grenz-Artefakte)
+                                let rand_l_real = (F::sin(order * F::new(12.9898)) - F::floor(F::sin(order * F::new(12.9898)))) * F::new(2.0) - F::new(1.0);
+                                let rand_l_imag = (F::cos(order * F::new(78.2330)) - F::floor(F::cos(order * F::new(78.2330)))) * F::new(2.0) - F::new(1.0);
+                                let rand_r_real = (F::sin(order * F::new(45.1640)) - F::floor(F::sin(order * F::new(45.1640)))) * F::new(2.0) - F::new(1.0);
+                                let rand_r_imag = (F::cos(order * F::new(92.7410)) - F::floor(F::cos(order * F::new(92.7410)))) * F::new(2.0) - F::new(1.0);
+
+                                let freq_factor = F::new(1.0) + (real_freq * high_freq_damping * F::new(0.0001));
+                                let effective_decay = room_size_seconds / freq_factor;
+                                let amplitude_decay = F::exp(-order / F::max(F::new(1.0), effective_decay * F::new(2.0))) * F::new(0.15);
+
+                                let ir_l_real = rand_l_real * amplitude_decay; let ir_l_imag = rand_l_imag * amplitude_decay;
+                                let ir_r_real = rand_r_real * amplitude_decay; let ir_r_imag = rand_r_imag * amplitude_decay;
+
+                                let mid_real = (ir_l_real + ir_r_real) * F::new(0.5); let mid_imag = (ir_l_imag + ir_r_imag) * F::new(0.5);
+                                let final_l_real = mid_real + stereo_width * (ir_l_real - mid_real); let final_l_imag = mid_imag + stereo_width * (ir_l_imag - mid_imag);
+                                let final_r_real = mid_real + stereo_width * (ir_r_real - mid_real); let final_r_imag = mid_imag + stereo_width * (ir_r_imag - mid_imag);
+
+                                let wet_l_real = filtered_synth_real * final_l_real; let wet_l_imag = filtered_synth_real * final_l_imag;
+                                let wet_r_real = filtered_synth_real * final_r_real; let wet_r_imag = filtered_synth_real * final_r_imag;
+
+                                let res_l_real = (F::new(1.0) - wet_dry_mix) * filtered_synth_real + wet_dry_mix * wet_l_real;
+                                let res_l_imag = wet_dry_mix * wet_l_imag;
+                                let res_r_real = (F::new(1.0) - wet_dry_mix) * filtered_synth_real + wet_dry_mix * wet_r_real;
+                                let res_r_imag = wet_dry_mix * wet_r_imag;
+
                                 // --- KORREKTUR: SEITENBAND-SPEZIFISCHE PHASEN-STETIGKEIT ---
+                                // 1. Berechne die exakte historische Frequenz, die DIESES Seitenband im letzten Block hatte!
                                 let old_real_freq = old_carrier_freq + (sign * order * old_mod_freq);
 
+                                // 2. Wandle beide Frequenzen in präzise IDFT-Phasenschritte um
                                 let exact_k_f = (real_freq * samples_per_block_f) / sample_rate;
                                 let base_exact_k_f = (old_real_freq * samples_per_block_f) / sample_rate;
 
+                                // 3. Zusammenfügen: Der historische Anker nutzt nun das exakt passende Vorblock-Seitenband
                                 let phase_history = (F::new(2.0) * pi * base_exact_k_f * block_start_sample) / samples_per_block_f;
                                 let phase_local = (F::new(2.0) * pi * exact_k_f * local_sample_n) / samples_per_block_f;
 
                                 let angle = phase_history + phase_local;
-                                let cos_a = F::cos(angle);
+                                let cos_a = F::cos(angle); let sin_a = F::sin(angle);
 
-                                final_sample += filtered_synth_real * cos_a;
+                                final_sample_l += res_l_real * cos_a - res_l_imag * sin_a;
+                                final_sample_r += res_r_real * cos_a - res_r_imag * sin_a;
                             }
                         }
                     }
@@ -222,16 +278,16 @@ pub fn cubek_voice_synth<F: Float + CubeElement>(
             }
         }
 
-        // 3. GAIN-STAGING (kein Limiter — der Mixer clippt am Ende)
+        // 3. SICHERES GAIN-STAGING & LIMITER
         let scale = F::new(0.05);
-        let out = final_sample * scale * master_amp;
-
-        // TROCKENES MONO: L=R=dry. Stereo-Width macht der Mixer.
-        // Adressierung: Stimme v beginnt bei v * fft_size * 2 (planar).
         let base: usize = (voice_index * fft_size * 2) as usize;
         let idx_l: usize = base + (n * 2) as usize;
         let idx_r: usize = base + (n * 2 + 1) as usize;
-        voices_dry[idx_l] = out;
-        voices_dry[idx_r] = out;
+
+        let out_l = final_sample_l * scale * master_amp;
+        let out_r = final_sample_r * scale * master_amp;
+
+        voices_out[idx_l] = F::max(-F::new(1.0), F::min(F::new(1.0), out_l));
+        voices_out[idx_r] = F::max(-F::new(1.0), F::min(F::new(1.0), out_r));
     }
 }
