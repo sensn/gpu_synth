@@ -105,7 +105,11 @@ impl WebAudioEngine {
     pub fn new() -> Self {
         Self {
             client: None,
-            fft_size: 512, //2048
+            fft_size: 2048, // NICHT 512: Bei 512 Samples @ 48 kHz beträgt das
+            // Block-Budget nur 10,7 ms — der WebGPU-Roundtrip (Uploads +
+            // N+1 Launches + Readback) braucht real 15–30 ms. Render >
+            // Budget => FIFO läuft immer leer => gehacktes Audio. 2048
+            // Samples = 42,7 ms Budget pro Block — der alte "playable"-Stand.
             sample_rate: Cell::new(44100.0),
             last_cutoff: Cell::new(800.0),
             lfo_phase: Cell::new(0.0),

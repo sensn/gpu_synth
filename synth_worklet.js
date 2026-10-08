@@ -31,9 +31,8 @@
 //     Einzelstimme auf ±1, die Mixer-Summe × Gain (bis 15x) konnte die
 //     DAC-Grenze hart clippen → Crackle auf Transienten.
 //   - 5 ms Einblendrampe nach Start/Underrun (kein harter Knacks).
-//   - FIFO-Ziel 6 Blöcke (~64 ms @ fft_size=512/48 kHz): Puffer gegen
-//     Main-Thread-Stalls (GC, GPU-Readback-Jitter). 3 Blöcke (~32 ms)
-//     waren zu dünn — jeder Stall > 32 ms endete in einem Underrun-Click.
+//   - FIFO-Ziel 4 Blöcke (~171 ms @ fft_size=2048/48 kHz): Puffer gegen
+//     Main-Thread-Stalls (GC, GPU-Readback-Jitter).
 //   - SAMPLERATE: Der Kernel rendert nativ auf der Context-Rate — kein
 //     Resampling. Der lineare Streaming-Resampler bleibt als Sicherheitsnetz
 //     mit ratio = 1.0 aktiv.
@@ -41,10 +40,11 @@
 
 const WORKLET_NAME = "cubecl-synth-processor";
 
-// FIFO-Ziel: ~6 Kernel-Blöcke. Bei fft_size=512 ≈ 10.7 ms pro Block @ 48 kHz
-// → ~64 ms Puffer. 1 Block wird konsumiert + Reserve für GPU-Readback-Jitter
-// und GC-Pausen auf dem Main-Thread.
-const TARGET_QUEUE = 6;
+// FIFO-Ziel: 4 Kernel-Blöcke. Bei fft_size=2048 ≈ 42,7 ms pro Block @ 48 kHz
+// → ~171 ms Puffer. 1 Block wird konsumiert + Reserve für GPU-Readback-Jitter
+// und GC-Pausen auf dem Main-Thread. (Block-Budget 42,7 ms > Render-Zeit
+// 15–30 ms → die Pumpe hält den Füllstand dauerhaft.)
+const TARGET_QUEUE = 4;
 
 // Metering alle 8 Render-Quanten (8 × 128 Samples ≈ 21 ms @ 48 kHz) —
 // entspricht der alten 25 ms UI-Kadenz, statt ~340 Nachrichten/s.
