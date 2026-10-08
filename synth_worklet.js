@@ -13,33 +13,46 @@
 //   Worklet:     FIFO aus {l, r} Paaren → process() füllt outputs[0]
 //                → postMessage({type:"ack", count}) wenn FIFO unter Ziel
 //
-// Eigenschaften:
-//   - Kein AudioBufferSourceNode-Chain-Scheduling mehr: kein Node-Garbage,
-//     sample-genaues Timing, Gain-Änderungen wirken sofort (im Audio-Thread).
+// FLOW-CONTROL (Fix gegen den Ack-Sturm):
+//   Der Worklet zählt offene Aufträge (inFlight = angefordert, aber noch
+//   nicht geliefert). requestBlocks() fordert NUR
+//       TARGET_QUEUE - fifo - inFlight
+//   an. Vorher wurde jede Render-Quantum (2,7 ms) erneut TARGET - fifo
+//   angefordert, während die GPU noch renderte → Ack-Sturm → die Pumpe auf
+//   dem Main-Thread flutete den FIFO, die Latenz explodierte und das
+//   Timing raste. Kommt ein Render nie an (GPU-Fehler), sendet der Host
+//   {type:"fail", count} — der Worklet korrigiert inFlight, damit die
+//   Flow-Control nicht für immer stehen bleibt.
+//
+// ANTI-CLICK-MASSNAHMEN:
+//   - Gain-Glättung: One-Pole ~5 ms pro Sample statt hartem Sprung
+//     (Zipper-Noise bei jedem Slider-Move vorher hörbar als Click).
+//   - Soft-Clip (C1-stetig) NACH dem Gain: der Kernel limitiert nur die
+//     Einzelstimme auf ±1, die Mixer-Summe × Gain (bis 15x) konnte die
+//     DAC-Grenze hart clippen → Crackle auf Transienten.
+//   - 5 ms Einblendrampe nach Start/Underrun (kein harter Knacks).
+//   - FIFO-Ziel 6 Blöcke (~64 ms @ fft_size=512/48 kHz): Puffer gegen
+//     Main-Thread-Stalls (GC, GPU-Readback-Jitter). 3 Blöcke (~32 ms)
+//     waren zu dünn — jeder Stall > 32 ms endete in einem Underrun-Click.
 //   - SAMPLERATE: Der Kernel rendert nativ auf der Context-Rate — kein
 //     Resampling. Der lineare Streaming-Resampler bleibt als Sicherheitsnetz
-//     mit ratio = 1.0 aktiv (falls sampleRateIn je von der Context-Rate
-//     abweichen sollte, bleibt der Code korrekt).
-//   - Underrun-Schutz: bei leerem FIFO Stille + 5 ms Einblendrampe beim
-//     Wiederkommen (kein harter Knacks), Underrun-Zähler fürs Debugging.
-//   - Ack-Protokoll (bedarfsgesteuerte GPU-Pumpe): der Worklet fordert genau
-//     dann neue Blöcke an, wenn sein FIFO unter das Ziel fällt — die GPU
-//     rendert nur bei Bedarf, der FIFO läuft nie über.
-//   - Start: der Main-Thread sendet "prime" (deterministisch, statt auf den
-//     Konstruktor-Ack zu vertrauen), der Worklet fordert darauf die ersten
-//     Blöcke an.
+//     mit ratio = 1.0 aktiv.
 // ============================================================================
 
 const WORKLET_NAME = "cubecl-synth-processor";
 
-// FIFO-Ziel: ~3 Kernel-Blöcke. Bei fft_size=512 ≈ 11 ms pro Block @ 44.1 kHz
-// (≈ 10.7 ms @ 48 kHz) → ~35 ms Latenz; bei fft_size=2048 ≈ 46 ms → ~140 ms.
-// 1 Block wird konsumiert + Reserve für GPU-Readback-Jitter/GC-Pausen.
-const TARGET_QUEUE = 3;
+// FIFO-Ziel: ~6 Kernel-Blöcke. Bei fft_size=512 ≈ 10.7 ms pro Block @ 48 kHz
+// → ~64 ms Puffer. 1 Block wird konsumiert + Reserve für GPU-Readback-Jitter
+// und GC-Pausen auf dem Main-Thread.
+const TARGET_QUEUE = 6;
 
-// Metering alle 8 Render-Quanten (8 × 128 Samples ≈ 23 ms @ 44.1 kHz) —
+// Metering alle 8 Render-Quanten (8 × 128 Samples ≈ 21 ms @ 48 kHz) —
 // entspricht der alten 25 ms UI-Kadenz, statt ~340 Nachrichten/s.
 const METER_EVERY = 8;
+
+// Soft-Clip-Schwelle: darunter komplett linear (transparent), darüber
+// C1-stetige Sättigung gegen ±1 — kein hartes Digital-Clipping mehr.
+const CLIP_T = 0.9;
 
 class SynthWorkletProcessor extends AudioWorkletProcessor {
     constructor(options) {
@@ -51,6 +64,9 @@ class SynthWorkletProcessor extends AudioWorkletProcessor {
         // FIFO: {l: Float32Array, r: Float32Array}
         this.queue = [];
         this.currentBlock = null;
+        // Offene Aufträge: bereits per ack angefordert, aber noch nicht
+        // geliefert. Das ist der Kern des Ack-Sturm-Fixes.
+        this.inFlight = 0;
         // Resampler-Position im Quellblock (in Quell-Samples, fraktional).
         // Der Fraktionalanteil wird über Blockgrenzen mitgenommen (Carry),
         // damit das Resampling sample-kontinuierlich bleibt.
@@ -60,18 +76,29 @@ class SynthWorkletProcessor extends AudioWorkletProcessor {
         this.fadeStep = 1.0 / (0.005 * sampleRate);
         this.wasUnderrun = false;
         this.underruns = 0;
+        // Gain: Ziel (vom Host) und geglätteter Ist-Wert (wirkt per Sample).
         this.gain = 1.0;
+        this.gainSmooth = 1.0;
+        // One-Pole-Glättung ~5 ms: selbst ein 15x-Sprung wird in ~25 ms
+        // abgefahren — hörbar glatt, aber frei von Zipper-Clicks.
+        this.gainCoef = 1.0 / (0.005 * sampleRate);
         // Metering
         this.peakL = 0;
         this.peakR = 0;
         this.quantumCount = 0;
+        this.alive = true;
 
         this.port.onmessage = (e) => {
             const m = e.data;
             if (m.type === "block") {
                 this.queue.push({ l: m.l, r: m.r });
+                if (this.inFlight > 0) this.inFlight--;
             } else if (m.type === "gain") {
                 this.gain = m.value;
+            } else if (m.type === "fail") {
+                // Render scheiterte: dieser Block kommt nie. In-Flight
+                // korrigieren, sonst wartet die Flow-Control dauerhaft.
+                this.inFlight = Math.max(0, this.inFlight - (m.count || 1));
             } else if (m.type === "prime") {
                 // Deterministischer Start: erste Blöcke anfordern
                 this.requestBlocks();
@@ -82,17 +109,31 @@ class SynthWorkletProcessor extends AudioWorkletProcessor {
     }
 
     requestBlocks() {
-        // Fordert genau die fehlenden Blöcke an. Der Main-Thread rendert pro
-        // Anfrage einen Block (sequenziell, nie parallel — der WASM-Engine-
-        // Zustand ist nicht nebenläufigkeitssicher).
-        const missing = TARGET_QUEUE - this.queue.length;
+        // NUR die wirklich fehlenden Blöcke anfordern: Ziel minus FIFO minus
+        // offener Aufträge. Solange die GPU in Verzug ist, wird hier nichts
+        // Neues angefordert — genau das verhindert den Ack-Sturm. Der
+        // Main-Thread rendert weiterhin sequenziell (nie parallel — der
+        // WASM-Engine-Zustand ist nicht nebenläufigkeitssicher).
+        const missing = TARGET_QUEUE - this.queue.length - this.inFlight;
         if (missing > 0) {
+            this.inFlight += missing;
             this.port.postMessage({ type: "ack", count: missing, underruns: this.underruns });
         }
     }
 
+    // C1-stetiger Soft-Clip: linear bis CLIP_T, danach asymptotisch gegen ±1.
+    // Steigung an der Schwelle = 1 → die Kurve selbst kann nicht klicken.
+    softClip(x) {
+        const ax = x < 0 ? -x : x;
+        if (ax <= CLIP_T) return x;
+        const s = x < 0 ? -1 : 1;
+        const over = ax - CLIP_T;
+        const head = 1.0 - CLIP_T;
+        return s * (CLIP_T + head * (over / (over + head)));
+    }
+
     process(inputs, outputs) {
-        if (this.alive === false) return false;
+        if (!this.alive) return false;
         const out = outputs[0];
         const L = out[0];
         const R = out[1] || out[0];
@@ -100,7 +141,7 @@ class SynthWorkletProcessor extends AudioWorkletProcessor {
         const ratio = this.sampleRateIn / sampleRate; // Quell-Steps pro Ziel-Sample
 
         for (let i = 0; i < n; i++) {
-            // Nächsten Block anfordern, wenn keiner aktiv ist
+            // Nächsten Block aktivieren, wenn keiner mehr läuft
             if (this.currentBlock === null) {
                 const next = this.queue.shift();
                 if (next !== undefined) {
@@ -127,8 +168,13 @@ class SynthWorkletProcessor extends AudioWorkletProcessor {
             const i0 = p | 0;
             const frac = p - i0;
             const i1 = i0 + 1 < len ? i0 + 1 : i0;
-            let sL = (blk.l[i0] + (blk.l[i1] - blk.l[i0]) * frac) * this.gain;
-            let sR = (blk.r[i0] + (blk.r[i1] - blk.r[i0]) * frac) * this.gain;
+            let sL = blk.l[i0] + (blk.l[i1] - blk.l[i0]) * frac;
+            let sR = blk.r[i0] + (blk.r[i1] - blk.r[i0]) * frac;
+
+            // Gain pro Sample glätten (One-Pole) — kein Sprung, kein Click.
+            this.gainSmooth += (this.gain - this.gainSmooth) * this.gainCoef;
+            sL = this.softClip(sL * this.gainSmooth);
+            sR = this.softClip(sR * this.gainSmooth);
 
             // 5 ms Einblendrampe (nach Start und nach jedem Underrun)
             if (this.fade < 1.0) {

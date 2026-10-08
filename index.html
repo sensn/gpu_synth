@@ -289,6 +289,10 @@
             document.getElementById("start-btn").disabled = true;
             document.getElementById("start-btn").innerText = "Engine läuft 🟢";
             isPlaying = true;
+            // Gain einmalig beim Start senden (Worklet-Default ist 1.0x).
+            // Danach übernimmt der Slider-Listener live — kein Posten pro
+            // Block mehr (raced vorher mit dem Listener).
+            workletNode.port.postMessage({ type: "gain", value: parseFloat(document.getElementById("gain-slider").value) });
             // Deterministischer Start: Worklet fordert per prime die ersten
             // Blöcke an, danach läuft das ack-Protokoll im Gleichgewicht.
             workletNode.port.postMessage({ type: "prime" });
@@ -327,7 +331,6 @@
             
             const algo = parseInt(document.getElementById("algo-select").value);
             const obeMode = parseInt(document.getElementById("obe-mode-select").value);
-            const volumeGain = parseFloat(document.getElementById("gain-slider").value);
 
             for (let i = 0; i < 6; i++) {
                 targetRatios[i] = parseFloat(document.getElementById(`op${i+1}-ratio-slider`).value);
@@ -358,11 +361,19 @@
                 l[i] = audioData[i * 2];
                 r[i] = audioData[i * 2 + 1];
             }
-            // Gain im Worklet anwenden lassen (reagiert sofort auf Slider-Änderung)
-            workletNode.port.postMessage({ type: "gain", value: volumeGain }, []);
+            // Gain wird NICHT mehr pro Block gepostet: das raced mit dem
+            // Slider-Listener (konnte veraltete Werte überschreiben → Gain-
+            // Sprünge → Clicks). Der Listener postet Gain live; beim Start
+            // wird er einmalig gesendet.
             workletNode.port.postMessage({ type: "block", l: l, r: r }, [l.buffer, r.buffer]);
 
-        } catch (gpuError) { console.error("WebGPU Pipeline Stau:", gpuError); }
+        } catch (gpuError) {
+            console.error("WebGPU Pipeline Stau:", gpuError);
+            // Flow-Control-Korrektur: Dieser Block kommt nie an. Ohne "fail"
+            // würde der Worklet ihn für immer als "in Bearbeitung" zählen
+            // (inFlight-Leak) und die Pipeline dauerhaft stallen.
+            if (workletNode) workletNode.port.postMessage({ type: "fail", count: 1 });
+        }
         renderInFlight = false;
         pumpRenders(); // nächste offene Anfrage sofort bedienen
     }
